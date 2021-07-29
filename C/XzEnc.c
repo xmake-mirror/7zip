@@ -1,5 +1,5 @@
 /* XzEnc.c -- Xz Encode
-2018-04-28 : Igor Pavlov : Public domain */
+2021-04-01 : Igor Pavlov : Public domain */
 
 #include "Precomp.h"
 
@@ -36,7 +36,7 @@
 
 
 #define XzBlock_ClearFlags(p)       (p)->flags = 0;
-#define XzBlock_SetNumFilters(p, n) (p)->flags |= ((n) - 1);
+#define XzBlock_SetNumFilters(p, n) (p)->flags = (Byte)((p)->flags | ((n) - 1));
 #define XzBlock_SetHasPackSize(p)   (p)->flags |= XZ_BF_PACK_SIZE;
 #define XzBlock_SetHasUnpackSize(p) (p)->flags |= XZ_BF_UNPACK_SIZE;
 
@@ -366,7 +366,7 @@ static SRes SeqInFilter_Read(const ISeqInStream *pp, void *data, size_t *size)
       SRes res;
       *size = sizeOriginal;
       res = p->StateCoder.Code2(p->StateCoder.p,
-          data, size,
+          (Byte *)data, size,
           p->buf + p->curPos, &srcLen,
           p->srcWasFinished, CODER_FINISH_ANY,
           &status);
@@ -552,7 +552,7 @@ static void XzEncProps_Normalize_Fixed(CXzProps *p)
         numBlocks++;
       if (numBlocks < (unsigned)t2)
       {
-        t2r = (unsigned)numBlocks;
+        t2r = (int)numBlocks;
         if (t2r == 0)
           t2r = 1;
         t3 = t1 * t2r;
@@ -751,7 +751,8 @@ static SRes Xz_CompressBlock(
     }
     else if (fp->ipDefined)
     {
-      SetUi32(filter->props, fp->ip);
+      Byte *ptr = filter->props;
+      SetUi32(ptr, fp->ip);
       filter->propsSize = 4;
     }
   }
@@ -814,7 +815,7 @@ static SRes Xz_CompressBlock(
     SRes res;
     Byte *outBuf = NULL;
     size_t outSize = 0;
-    Bool useStream = (fp || inStream);
+    BoolInt useStream = (fp || inStream);
     // useStream = True;
     
     if (!useStream)
@@ -940,7 +941,7 @@ typedef struct
   #ifndef _7ZIP_ST
   unsigned checkType;
   ISeqOutStream *outStream;
-  Bool mtCoder_WasConstructed;
+  BoolInt mtCoder_WasConstructed;
   CMtCoder mtCoder;
   CXzEncBlockInfo EncBlocks[MTCODER__BLOCKS_MAX];
   #endif
@@ -1196,7 +1197,7 @@ SRes XzEnc_Encode(CXzEncHandle pp, ISeqOutStream *outStream, ISeqInStream *inStr
       p->outBufSize = destBlockSize;
     }
 
-    p->mtCoder.numThreadsMax = props->numBlockThreads_Max;
+    p->mtCoder.numThreadsMax = (unsigned)props->numBlockThreads_Max;
     p->mtCoder.expectedDataSize = p->expectedDataSize;
     
     RINOK(MtCoder_Code(&p->mtCoder));

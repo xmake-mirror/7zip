@@ -164,14 +164,12 @@ bool CBenchmarkDialog::OnInit()
       s = s2;
       SetItemText(IDT_BENCH_CPU, s);
     }
-    /*
     {
       AString s2;
-      GetCpuFeatures(s2);
+      AddCpuFeatures(s2);
       s = s2;
       SetItemText(IDT_BENCH_CPU_FEATURE, s);
     }
-    */
 
     s = "7-Zip " MY_VERSION_CPU;
     SetItemText(IDT_BENCH_VER, s);
@@ -324,7 +322,6 @@ static void PrintSize_MB(UString &s, UInt64 size)
   s += kMB;
 }
 
-extern bool g_LargePagesMode;
 
 UInt32 CBenchmarkDialog::OnChangeDictionary()
 {
@@ -338,8 +335,14 @@ UInt32 CBenchmarkDialog::OnChangeDictionary()
     s += " / ";
     PrintSize_MB(s, ramSize);
   }
-  if (g_LargePagesMode)
-    s += " LP";
+
+  #ifdef _7ZIP_LARGE_PAGES
+  {
+    AString s2;
+    Add_LargePages_String(s2);
+    s += s2;
+  }
+  #endif
 
   SetItemText(IDT_BENCH_MEMORY_VAL, s);
 
@@ -379,7 +382,7 @@ void CBenchmarkDialog::OnChangeSettings()
   EnableItem(IDB_STOP, true);
   UInt32 dict = OnChangeDictionary();
   
-  for (int i = 0; i < ARRAY_SIZE(g_IDs); i++)
+  for (unsigned i = 0; i < ARRAY_SIZE(g_IDs); i++)
     SetItemText(g_IDs[i], kProcessingString);
   _startTime = GetTickCount();
   PrintTime();
@@ -512,7 +515,7 @@ bool CBenchmarkDialog::OnTimer(WPARAM /* timerID */, LPARAM /* callback */)
 
   {
     UInt32 dicSizeTemp = (UInt32)MyMax(Sync.ProcessedSize, UInt64(1) << 20);
-    dicSizeTemp = MyMin(dicSizeTemp, Sync.DictionarySize),
+    dicSizeTemp = MyMin(dicSizeTemp, Sync.DictionarySize);
     PrintResults(dicSizeTemp,
       Sync.CompressingInfoTemp,
       IDT_BENCH_COMPRESS_USAGE1,
@@ -927,8 +930,10 @@ HRESULT Benchmark(
 
   benchmarker.BenchmarkDialog = &bd;
 
-  NWindows::CThread thread;
-  RINOK(thread.Create(CThreadBenchmark::MyThreadFunction, &benchmarker));
-  bd.Create(hwndParent);
-  return thread.Wait();
+  {
+    NWindows::CThread thread;
+    RINOK(thread.Create(CThreadBenchmark::MyThreadFunction, &benchmarker));
+    bd.Create(hwndParent);
+    return thread.Wait_Close();
+  }
 }

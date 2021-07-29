@@ -2,6 +2,11 @@
 
 #include "StdAfx.h"
 
+/*
+#include <stdio.h>
+#include <string.h>
+*/
+
 #include "../Common/MyCom.h"
 #ifndef _UNICODE
 #include "../Common/StringConvert.h"
@@ -114,9 +119,22 @@ UString CDrop::QueryFileName(UINT fileIndex)
 void CDrop::QueryFileNames(UStringVector &fileNames)
 {
   UINT numFiles = QueryCountOfFiles();
+  /*
+  char s[100];
+  sprintf(s, "QueryFileNames: %d files", numFiles);
+  OutputDebugStringA(s);
+  */
   fileNames.ClearAndReserve(numFiles);
   for (UINT i = 0; i < numFiles; i++)
-    fileNames.AddInReserved(QueryFileName(i));
+  {
+    const UString s2 = QueryFileName(i);
+    if (!s2.IsEmpty())
+      fileNames.AddInReserved(s2);
+    /*
+    OutputDebugStringW(L"file ---");
+    OutputDebugStringW(s2);
+    */
+  }
 }
 
 
@@ -174,7 +192,7 @@ bool BrowseForFolder(LPBROWSEINFO browseInfo, CSysString &resultPath)
 }
 
 
-int CALLBACK BrowseCallbackProc(HWND hwnd, UINT uMsg, LPARAM /* lp */, LPARAM data)
+static int CALLBACK BrowseCallbackProc(HWND hwnd, UINT uMsg, LPARAM /* lp */, LPARAM data)
 {
   #ifndef UNDER_CE
   switch (uMsg)
@@ -203,7 +221,7 @@ int CALLBACK BrowseCallbackProc(HWND hwnd, UINT uMsg, LPARAM /* lp */, LPARAM da
 }
 
 
-bool BrowseForFolder(HWND owner, LPCTSTR title, UINT ulFlags,
+static bool BrowseForFolder(HWND owner, LPCTSTR title, UINT ulFlags,
     LPCTSTR initialFolder, CSysString &resultPath)
 {
   CSysString displayName;
@@ -257,7 +275,7 @@ bool GetPathFromIDList(LPCITEMIDLIST itemIDList, UString &path)
 
 typedef LPITEMIDLIST (WINAPI * SHBrowseForFolderWP)(LPBROWSEINFOW lpbi);
 
-bool BrowseForFolder(LPBROWSEINFOW browseInfo, UString &resultPath)
+static bool BrowseForFolder(LPBROWSEINFOW browseInfo, UString &resultPath)
 {
   NWindows::NCOM::CComInitializer comInitializer;
   SHBrowseForFolderWP shBrowseForFolderW = (SHBrowseForFolderWP)
@@ -272,7 +290,7 @@ bool BrowseForFolder(LPBROWSEINFOW browseInfo, UString &resultPath)
   return GetPathFromIDList(itemIDList, resultPath);
 }
 
-
+static
 int CALLBACK BrowseCallbackProc2(HWND hwnd, UINT uMsg, LPARAM /* lp */, LPARAM data)
 {
   switch (uMsg)
