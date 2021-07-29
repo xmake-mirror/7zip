@@ -29,16 +29,16 @@ public:
   CMyComPtr<IFolderOperationsExtractCallback> ExtractCallback;
   
   CHashBundle Hash;
-  UString FirstFilePath;
+  // UString FirstFilePath;
 
-  HRESULT Result;
+  // HRESULT Result2;
 
   void ShowFinalResults(HWND hwnd);
   
   CPanelCopyThread():
-    Result(E_FAIL),
     ResultsWereShown(false),
     NeedShowRes(false)
+    // , Result2(E_FAIL)
     {}
 };
 
@@ -48,7 +48,7 @@ void CPanelCopyThread::ShowFinalResults(HWND hwnd)
   if (!ResultsWereShown)
   {
     ResultsWereShown = true;
-    ShowHashResults(Hash, fs2us(FirstFilePath), hwnd);
+    ShowHashResults(Hash, hwnd);
   }
 }
   
@@ -68,6 +68,8 @@ HRESULT CPanelCopyThread::ProcessVirt()
   }
   */
 
+  HRESULT result2;
+
   if (options->testMode)
   {
     CMyComPtr<IArchiveFolder> archiveFolder;
@@ -79,32 +81,32 @@ HRESULT CPanelCopyThread::ProcessVirt()
     NExtract::NPathMode::EEnum pathMode =
         NExtract::NPathMode::kCurPaths;
         // NExtract::NPathMode::kFullPathnames;
-    Result = archiveFolder->Extract(&Indices.Front(), Indices.Size(),
+    result2 = archiveFolder->Extract(&Indices.Front(), Indices.Size(),
         BoolToInt(options->includeAltStreams),
         BoolToInt(options->replaceAltStreamChars),
         pathMode, NExtract::NOverwriteMode::kAsk,
         options->folder, BoolToInt(true), extractCallback2);
   }
   else
-    Result = FolderOperations->CopyTo(
+    result2 = FolderOperations->CopyTo(
       BoolToInt(options->moveMode),
       &Indices.Front(), Indices.Size(),
       BoolToInt(options->includeAltStreams),
       BoolToInt(options->replaceAltStreamChars),
       options->folder, ExtractCallback);
 
-  if (Result == S_OK && !ExtractCallbackSpec->ThereAreMessageErrors)
+  if (result2 == S_OK && !ExtractCallbackSpec->ThereAreMessageErrors)
   {
     if (!options->hashMethods.IsEmpty())
       NeedShowRes = true;
     else if (options->testMode)
     {
       CProgressMessageBoxPair &pair = GetMessagePair(false); // GetMessagePair(ExtractCallbackSpec->Hash.NumErrors != 0);
-      AddHashBundleRes(pair.Message, Hash, FirstFilePath);
+      AddHashBundleRes(pair.Message, Hash);
     }
   }
 
-  return Result;
+  return result2;
 }
 
 
@@ -158,7 +160,10 @@ HRESULT CPanel::CopyTo(CCopyToOptions &options, const CRecordVector<UInt32> &ind
 
 
   if (indices.Size() == 1)
-    extracter.FirstFilePath = GetItemRelPath(indices[0]);
+  {
+    extracter.Hash.FirstFileName = GetItemRelPath(indices[0]);
+    extracter.Hash.MainName = extracter.Hash.FirstFileName;
+  }
 
   if (options.VirtFileSystem)
   {
@@ -186,7 +191,7 @@ HRESULT CPanel::CopyTo(CCopyToOptions &options, const CRecordVector<UInt32> &ind
     extracter.ExtractCallbackSpec->SetHashCalc(&extracter.Hash);
   }
 
-  extracter.Hash.Init();
+  // extracter.Hash.Init();
 
   UString title;
   {
@@ -229,6 +234,8 @@ HRESULT CPanel::CopyTo(CCopyToOptions &options, const CRecordVector<UInt32> &ind
 
   if (messages)
     *messages = extracter.Sync.Messages;
+
+  // res = extracter.Result2;
   res = extracter.Result;
 
   if (res == S_OK && extracter.ExtractCallbackSpec->IsOK())
@@ -324,9 +331,11 @@ HRESULT CPanel::CopyFrom(bool moveMode, const UString &folderPrefix, const UStri
   for (i = 0; i < updater.FileNames.Size(); i++)
     updater.FileNamePointers.AddInReserved(updater.FileNames[i]);
 
-  NWindows::CThread thread;
-  RINOK(thread.Create(CThreadUpdate::MyThreadFunction, &updater));
-  updater.ProgressDialog.Create(title, thread, GetParent());
+  {
+    NWindows::CThread thread;
+    RINOK(thread.Create(CThreadUpdate::MyThreadFunction, &updater));
+    updater.ProgressDialog.Create(title, thread, GetParent());
+  }
 
   if (messages)
     *messages = updater.ProgressDialog.Sync.Messages;

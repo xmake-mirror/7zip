@@ -55,6 +55,7 @@ WIN_OBJS = \
   $O\Shell.obj \
   $O\Synchronization.obj \
   $O\System.obj \
+  $O\SystemInfo.obj \
   $O\TimeUtils.obj \
   $O\Window.obj \
 
@@ -134,6 +135,7 @@ COMPRESS_OBJS = \
 C_OBJS = \
   $O\Alloc.obj \
   $O\CpuArch.obj \
+  $O\DllSecur.obj \
   $O\Sort.obj \
   $O\Threads.obj \
 

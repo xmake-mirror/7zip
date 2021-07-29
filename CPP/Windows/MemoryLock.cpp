@@ -2,6 +2,8 @@
 
 #include "StdAfx.h"
 
+#include "../../C/CpuArch.h"
+
 #include "MemoryLock.h"
 
 namespace NWindows {
@@ -73,8 +75,11 @@ typedef void (WINAPI * Func_RtlGetVersion) (OSVERSIONINFOEXW *);
 
 /*
   We suppose that Window 10 works incorrectly with "Large Pages" at:
-    - Windows 10 1703 (15063)
-    - Windows 10 1709 (16299)
+    - Windows 10 1703 (15063) : incorrect allocating after VirtualFree()
+    - Windows 10 1709 (16299) : incorrect allocating after VirtualFree()
+    - Windows 10 1809 (17763) : the failures for blocks of 1 GiB and larger,
+                                if CPU doesn't support 1 GB pages.
+  Windows 10 1903 (18362) probably works correctly.
 */
 
 unsigned Get_LargePages_RiskLevel()
@@ -83,13 +88,23 @@ unsigned Get_LargePages_RiskLevel()
   HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
   if (!ntdll)
     return 0;
-  Func_RtlGetVersion func = (Func_RtlGetVersion)GetProcAddress(ntdll, "RtlGetVersion");
+  Func_RtlGetVersion func = (Func_RtlGetVersion)(void *)GetProcAddress(ntdll, "RtlGetVersion");
   if (!func)
     return 0;
   func(&vi);
-  return (vi.dwPlatformId == VER_PLATFORM_WIN32_NT
-      && vi.dwMajorVersion + vi.dwMinorVersion == 10
-      && vi.dwBuildNumber <= 16299) ? 1 : 0;
+  if (vi.dwPlatformId != VER_PLATFORM_WIN32_NT)
+    return 0;
+  if (vi.dwMajorVersion + vi.dwMinorVersion != 10)
+    return 0;
+  if (vi.dwBuildNumber <= 16299)
+    return 1;
+
+  #ifdef MY_CPU_X86_OR_AMD64
+  if (vi.dwBuildNumber < 18362 && !CPU_IsSupported_PageGB())
+    return 1;
+  #endif
+
+  return 0;
 }
 
 #endif
