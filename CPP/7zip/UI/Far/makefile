@@ -1,11 +1,11 @@
 PROG = 7-ZipFar.dll
 DEF_FILE = Far.def
 CFLAGS = $(CFLAGS)  \
-  -DEXTERNAL_CODECS \
-  -DNEW_FOLDER_INTERFACE
+  -DZ7_EXTERNAL_CODECS \
 
 !IFNDEF UNDER_CE
-CFLAGS = $(CFLAGS) -DWIN_LONG_PATH
+# CFLAGS = $(CFLAGS) -DZ7_LONG_PATH
+# -DZ7_NO_LARGE_PAGES
 !ENDIF
 
 CURRENT_OBJS = \
@@ -22,6 +22,7 @@ CURRENT_OBJS = \
   $O\UpdateCallbackFar.obj \
 
 COMMON_OBJS = \
+  $O\DynLimBuf.obj \
   $O\IntToString.obj \
   $O\NewHandler.obj \
   $O\MyString.obj \
@@ -39,11 +40,13 @@ WIN_OBJS = \
   $O\FileIO.obj \
   $O\FileLink.obj \
   $O\FileName.obj \
+  $O\FileSystem.obj \
   $O\PropVariant.obj \
   $O\PropVariantConv.obj \
   $O\Registry.obj \
   $O\ResourceString.obj \
   $O\Synchronization.obj \
+  $O\System.obj \
   $O\TimeUtils.obj \
 
 7ZIP_COMMON_OBJS = \
@@ -52,6 +55,7 @@ WIN_OBJS = \
   $O\FileStreams.obj \
   $O\FilterCoder.obj \
   $O\LimitedStreams.obj \
+  $O\MethodProps.obj \
   $O\ProgressUtils.obj \
   $O\PropId.obj \
   $O\StreamObjects.obj \
@@ -64,6 +68,7 @@ UI_COMMON_OBJS = \
   $O\DefaultName.obj \
   $O\EnumDirItems.obj \
   $O\ExtractingFilePath.obj \
+  $O\HashCalc.obj \
   $O\LoadCodecs.obj \
   $O\OpenArchive.obj \
   $O\PropIDUtils.obj \
@@ -77,6 +82,7 @@ UI_COMMON_OBJS = \
   $O\ZipRegistry.obj \
 
 AR_COMMON_OBJS = \
+  $O\ItemNameUtils.obj \
   $O\OutStreamWithCRC.obj \
 
 AGENT_OBJS = \
@@ -84,7 +90,6 @@ AGENT_OBJS = \
   $O\AgentOut.obj \
   $O\AgentProxy.obj \
   $O\ArchiveFolder.obj \
-  $O\ArchiveFolderOpen.obj \
   $O\ArchiveFolderOut.obj \
   $O\UpdateCallbackAgent.obj \
 

@@ -1,10 +1,13 @@
 PROG = 7zFM.exe
 CFLAGS = $(CFLAGS) \
-  -DEXTERNAL_CODECS \
+  -DZ7_EXTERNAL_CODECS \
+
+# -DZ7_NO_LARGE_PAGES
 
 !include "FM.mak"
 
 COMMON_OBJS = \
+  $O\DynLimBuf.obj \
   $O\IntToString.obj \
   $O\Lang.obj \
   $O\MyString.obj \
@@ -84,6 +87,7 @@ UI_COMMON_OBJS = \
 
 EXPLORER_OBJS = \
   $O\ContextMenu.obj \
+  $O\MyMessages.obj \
   $O\RegistryContextMenu.obj \
 
 GUI_OBJS = \
@@ -92,6 +96,10 @@ GUI_OBJS = \
 
 COMPRESS_OBJS = \
   $O\CopyCoder.obj \
+
+AR_COMMON_OBJS = \
+  $O\ItemNameUtils.obj \
+
 
 C_OBJS = $(C_OBJS) \
   $O\Alloc.obj \

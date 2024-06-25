@@ -1,13 +1,14 @@
 PROG = 7-zip.dll
 DEF_FILE = Explorer.def
 CFLAGS = $(CFLAGS) \
-  -DLANG \
+  -DZ7_LANG \
 
 !IFDEF UNDER_CE
 LIBS = $(LIBS) Commctrl.lib
 !ELSE
 LIBS = $(LIBS) htmlhelp.lib comdlg32.lib Mpr.lib Gdi32.lib
-CFLAGS = $(CFLAGS) -DWIN_LONG_PATH
+# CFLAGS = $(CFLAGS) -DZ7_LONG_PATH
+# -DZ7_NO_LARGE_PAGES
 !ENDIF
 
 EXPLORER_OBJS = \
@@ -41,6 +42,7 @@ WIN_OBJS = \
   $O\ResourceString.obj \
   $O\Shell.obj \
   $O\Synchronization.obj \
+  $O\TimeUtils.obj \
   $O\Window.obj \
 
 !IFDEF UNDER_CE
@@ -65,10 +67,12 @@ FM_OBJS = \
   $O\HelpUtils.obj \
   $O\LangUtils.obj \
   $O\ProgramLocation.obj \
+  $O\PropertyName.obj \
   $O\RegistryUtils.obj \
 
 C_OBJS = \
   $O\CpuArch.obj \
+  $O\Sort.obj \
   $O\Threads.obj \
 
 !include "../../7zip.mak"

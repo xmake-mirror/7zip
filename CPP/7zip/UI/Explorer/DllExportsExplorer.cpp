@@ -1,4 +1,4 @@
-// DLLExports.cpp
+// DLLExportsExplorer.cpp
 //
 // Notes:
 // Win2000:
@@ -10,7 +10,22 @@
 
 #include "../../../Common/MyWindows.h"
 
+#if defined(__clang__) && __clang_major__ >= 4
+#pragma GCC diagnostic ignored "-Wnonportable-system-include-path"
+#endif
+// <olectl.h> : in new Windows Kit 10.0.2**** (NTDDI_WIN10_MN is defined)
+// <OleCtl.h> : in another Windows Kit versions
+#if defined(NTDDI_WIN10_MN) || defined(__MINGW32__) || defined(__MINGW64__)
+#include <olectl.h>
+#else
 #include <OleCtl.h>
+#endif
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#include <shlguid.h>
+#else
+#include <ShlGuid.h>
+#endif
 
 #include "../../../Common/MyInitGuid.h"
 
@@ -31,7 +46,7 @@ static LPCTSTR const k_Approved = TEXT("Software\\Microsoft\\Windows\\CurrentVer
 // {23170F69-40C1-278A-1000-000100020000}
 static LPCTSTR const k_Clsid = TEXT("{23170F69-40C1-278A-1000-000100020000}");
 
-DEFINE_GUID(CLSID_CZipContextMenu,
+Z7_DEFINE_GUID(CLSID_CZipContextMenu,
     k_7zip_GUID_Data1,
     k_7zip_GUID_Data2,
     k_7zip_GUID_Data3_Common,
@@ -41,37 +56,46 @@ using namespace NWindows;
 
 extern
 HINSTANCE g_hInstance;
-HINSTANCE g_hInstance = 0;
+HINSTANCE g_hInstance = NULL;
 
 extern
 HWND g_HWND;
-HWND g_HWND = 0;
+HWND g_HWND = NULL;
 
 extern
 LONG g_DllRefCount;
 LONG g_DllRefCount = 0; // Reference count of this DLL.
 
+extern
+bool g_DisableUserQuestions;
+bool g_DisableUserQuestions;
 
-// #define ODS(sz) OutputDebugString(L#sz)
 
-class CShellExtClassFactory:
+// #define ODS(sz) OutputDebugStringW(L#sz)
+#define ODS(sz)
+
+class CShellExtClassFactory Z7_final:
   public IClassFactory,
   public CMyUnknownImp
 {
-public:
-  CShellExtClassFactory() { InterlockedIncrement(&g_DllRefCount); }
-  ~CShellExtClassFactory() { InterlockedDecrement(&g_DllRefCount); }
-
-  MY_UNKNOWN_IMP1_MT(IClassFactory)
+  Z7_COM_UNKNOWN_IMP_1_MT(IClassFactory)
   
-  STDMETHODIMP CreateInstance(LPUNKNOWN, REFIID, void**);
-  STDMETHODIMP LockServer(BOOL);
+  STDMETHOD(CreateInstance)(LPUNKNOWN, REFIID, void**) Z7_override Z7_final;
+  STDMETHOD(LockServer)(BOOL) Z7_override Z7_final;
+public:
+   CShellExtClassFactory() { InterlockedIncrement(&g_DllRefCount); }
+  ~CShellExtClassFactory() { InterlockedDecrement(&g_DllRefCount); }
 };
 
-STDMETHODIMP CShellExtClassFactory::CreateInstance(LPUNKNOWN pUnkOuter,
+Z7_COMWF_B CShellExtClassFactory::CreateInstance(LPUNKNOWN pUnkOuter,
     REFIID riid, void **ppvObj)
 {
-  // ODS("CShellExtClassFactory::CreateInstance()\r\n");
+  ODS("CShellExtClassFactory::CreateInstance()\r\n");
+  /*
+  char s[64];
+  ConvertUInt32ToHex(riid.Data1, s);
+  OutputDebugStringA(s);
+  */
   *ppvObj = NULL;
   if (pUnkOuter)
     return CLASS_E_NOAGGREGATION;
@@ -85,14 +109,15 @@ STDMETHODIMP CShellExtClassFactory::CreateInstance(LPUNKNOWN pUnkOuter,
   if (!shellExt)
     return E_OUTOFMEMORY;
   
-  HRESULT res = shellExt->QueryInterface(riid, ppvObj);
+  IContextMenu *ctxm = shellExt;
+  const HRESULT res = ctxm->QueryInterface(riid, ppvObj);
   if (res != S_OK)
     delete shellExt;
   return res;
 }
 
 
-STDMETHODIMP CShellExtClassFactory::LockServer(BOOL /* fLock */)
+Z7_COMWF_B CShellExtClassFactory::LockServer(BOOL /* fLock */)
 {
   return S_OK; // Check it
 }
@@ -123,12 +148,12 @@ BOOL WINAPI DllMain(
   if (dwReason == DLL_PROCESS_ATTACH)
   {
     g_hInstance = (HINSTANCE)hInstance;
-    // ODS("In DLLMain, DLL_PROCESS_ATTACH\r\n");
+    ODS("In DLLMain, DLL_PROCESS_ATTACH\r\n");
     NT_CHECK
   }
   else if (dwReason == DLL_PROCESS_DETACH)
   {
-    // ODS("In DLLMain, DLL_PROCESS_DETACH\r\n");
+    ODS("In DLLMain, DLL_PROCESS_DETACH\r\n");
   }
   return TRUE;
 }
@@ -138,13 +163,19 @@ BOOL WINAPI DllMain(
 
 STDAPI DllCanUnloadNow(void)
 {
-  // ODS("In DLLCanUnloadNow\r\n");
+  ODS("In DLLCanUnloadNow\r\n");
+  /*
+  if (g_DllRefCount == 0)
+    ODS( "g_DllRefCount == 0");
+  else
+    ODS( "g_DllRefCount != 0");
+  */
   return (g_DllRefCount == 0 ? S_OK : S_FALSE);
 }
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
 {
-  // ODS("In DllGetClassObject\r\n");
+  ODS("In DllGetClassObject\r\n");
   *ppv = NULL;
   if (IsEqualIID(rclsid, CLSID_CZipContextMenu))
   {
@@ -156,7 +187,8 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
     catch(...) { return E_OUTOFMEMORY; }
     if (!cf)
       return E_OUTOFMEMORY;
-    HRESULT res = cf->QueryInterface(riid, ppv);
+    IClassFactory *cf2 = cf;
+    const HRESULT res = cf2->QueryInterface(riid, ppv);
     if (res != S_OK)
       delete cf;
     return res;
@@ -168,6 +200,7 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
 
 static BOOL RegisterServer()
 {
+  ODS("RegisterServer\r\n");
   FString modulePath;
   if (!NDLL::MyGetModuleFileName(modulePath))
     return FALSE;
@@ -197,12 +230,13 @@ static BOOL RegisterServer()
       key.SetValue(k_Clsid, k_ShellExtName);
   }
   
+  ODS("RegisterServer :: return TRUE");
   return TRUE;
 }
 
 STDAPI DllRegisterServer(void)
 {
-  return RegisterServer() ?  S_OK: SELFREG_E_CLASS;
+  return RegisterServer() ? S_OK: SELFREG_E_CLASS;
 }
 
 static BOOL UnregisterServer()

@@ -1,19 +1,19 @@
 /* Threads.c -- multithreading library
-2021-04-25 : Igor Pavlov : Public domain */
+2024-03-28 : Igor Pavlov : Public domain */
 
 #include "Precomp.h"
 
 #ifdef _WIN32
 
-#ifndef UNDER_CE
+#ifndef USE_THREADS_CreateThread
 #include <process.h>
 #endif
 
 #include "Threads.h"
 
-static WRes GetError()
+static WRes GetError(void)
 {
-  DWORD res = GetLastError();
+  const DWORD res = GetLastError();
   return res ? (WRes)res : 1;
 }
 
@@ -63,10 +63,10 @@ WRes Thread_Create(CThread *p, THREAD_FUNC_TYPE func, LPVOID param)
 {
   /* Windows Me/98/95: threadId parameter may not be NULL in _beginthreadex/CreateThread functions */
 
-  #ifdef UNDER_CE
+  #ifdef USE_THREADS_CreateThread
 
   DWORD threadId;
-  *p = CreateThread(0, 0, func, param, 0, &threadId);
+  *p = CreateThread(NULL, 0, func, param, 0, &threadId);
   
   #else
   
@@ -82,7 +82,7 @@ WRes Thread_Create(CThread *p, THREAD_FUNC_TYPE func, LPVOID param)
 
 WRes Thread_Create_With_Affinity(CThread *p, THREAD_FUNC_TYPE func, LPVOID param, CAffinityMask affinity)
 {
-  #ifdef UNDER_CE
+  #ifdef USE_THREADS_CreateThread
 
   UNUSED_VAR(affinity)
   return Thread_Create(p, func, param);
@@ -150,6 +150,17 @@ WRes Semaphore_Create(CSemaphore *p, UInt32 initCount, UInt32 maxCount)
   return HandleToWRes(*p);
 }
 
+WRes Semaphore_OptCreateInit(CSemaphore *p, UInt32 initCount, UInt32 maxCount)
+{
+  // if (Semaphore_IsCreated(p))
+  {
+    WRes wres = Semaphore_Close(p);
+    if (wres != 0)
+      return wres;
+  }
+  return Semaphore_Create(p, initCount, maxCount);
+}
+
 static WRes Semaphore_Release(CSemaphore *p, LONG releaseCount, LONG *previousCount)
   { return BOOLToWRes(ReleaseSemaphore(*p, releaseCount, previousCount)); }
 WRes Semaphore_ReleaseN(CSemaphore *p, UInt32 num)
@@ -158,8 +169,13 @@ WRes Semaphore_Release1(CSemaphore *p) { return Semaphore_ReleaseN(p, 1); }
 
 WRes CriticalSection_Init(CCriticalSection *p)
 {
-  /* InitializeCriticalSection can raise only STATUS_NO_MEMORY exception */
+  /* InitializeCriticalSection() can raise exception:
+     Windows XP, 2003 : can raise a STATUS_NO_MEMORY exception
+     Windows Vista+   : no exceptions */
   #ifdef _MSC_VER
+  #ifdef __clang__
+    #pragma GCC diagnostic ignored "-Wlanguage-extension-token"
+  #endif
   __try
   #endif
   {
@@ -167,7 +183,7 @@ WRes CriticalSection_Init(CCriticalSection *p)
     /* InitializeCriticalSectionAndSpinCount(p, 0); */
   }
   #ifdef _MSC_VER
-  __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
+  __except (EXCEPTION_EXECUTE_HANDLER) { return ERROR_NOT_ENOUGH_MEMORY; }
   #endif
   return 0;
 }
@@ -179,19 +195,26 @@ WRes CriticalSection_Init(CCriticalSection *p)
 
 // ---------- POSIX ----------
 
-#ifndef __APPLE__
-#ifndef _7ZIP_AFFINITY_DISABLE
+#if defined(__linux__) && !defined(__APPLE__) && !defined(_AIX) && !defined(__ANDROID__)
+#ifndef Z7_AFFINITY_DISABLE
 // _GNU_SOURCE can be required for pthread_setaffinity_np() / CPU_ZERO / CPU_SET
-#define _GNU_SOURCE
-#endif
-#endif
+// clang < 3.6       : unknown warning group '-Wreserved-id-macro'
+// clang 3.6 - 12.01 : gives warning "macro name is a reserved identifier"
+// clang >= 13       : do not give warning
+#if !defined(_GNU_SOURCE)
+Z7_DIAGNOSTIC_IGNORE_BEGIN_RESERVED_MACRO_IDENTIFIER
+// #define _GNU_SOURCE
+Z7_DIAGNOSTIC_IGNORE_END_RESERVED_MACRO_IDENTIFIER
+#endif // !defined(_GNU_SOURCE)
+#endif // Z7_AFFINITY_DISABLE
+#endif // __linux__
 
 #include "Threads.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _7ZIP_AFFINITY_SUPPORTED
+#ifdef Z7_AFFINITY_SUPPORTED
 // #include <sched.h>
 #endif
 
@@ -199,15 +222,12 @@ WRes CriticalSection_Init(CCriticalSection *p)
 // #include <stdio.h>
 // #define PRF(p) p
 #define PRF(p)
-
-#define Print(s) PRF(printf("\n%s\n", s))
-
-// #include <stdio.h>
+#define Print(s) PRF(printf("\n%s\n", s);)
 
 WRes Thread_Create_With_CpuSet(CThread *p, THREAD_FUNC_TYPE func, LPVOID param, const CCpuSet *cpuSet)
 {
   // new thread in Posix probably inherits affinity from parrent thread
-  Print("Thread_Create_With_CpuSet");
+  Print("Thread_Create_With_CpuSet")
 
   pthread_attr_t attr;
   int ret;
@@ -215,7 +235,7 @@ WRes Thread_Create_With_CpuSet(CThread *p, THREAD_FUNC_TYPE func, LPVOID param, 
 
   p->_created = 0;
 
-  RINOK(pthread_attr_init(&attr));
+  RINOK(pthread_attr_init(&attr))
 
   ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
@@ -223,8 +243,9 @@ WRes Thread_Create_With_CpuSet(CThread *p, THREAD_FUNC_TYPE func, LPVOID param, 
   {
     if (cpuSet)
     {
-      #ifdef _7ZIP_AFFINITY_SUPPORTED
-      
+      // pthread_attr_setaffinity_np() is not supported for MUSL compile.
+      // so we check for __GLIBC__ here
+#if defined(Z7_AFFINITY_SUPPORTED) && defined( __GLIBC__)
       /*
       printf("\n affinity :");
       unsigned i;
@@ -246,7 +267,7 @@ WRes Thread_Create_With_CpuSet(CThread *p, THREAD_FUNC_TYPE func, LPVOID param, 
       // ret2 =
       pthread_attr_setaffinity_np(&attr, sizeof(*cpuSet), cpuSet);
       // if (ret2) ret = ret2;
-      #endif
+#endif
     }
     
     ret = pthread_create(&p->_tid, &attr, func, param);
@@ -279,7 +300,7 @@ WRes Thread_Create(CThread *p, THREAD_FUNC_TYPE func, LPVOID param)
 
 WRes Thread_Create_With_Affinity(CThread *p, THREAD_FUNC_TYPE func, LPVOID param, CAffinityMask affinity)
 {
-  Print("Thread_Create_WithAffinity");
+  Print("Thread_Create_WithAffinity")
   CCpuSet cs;
   unsigned i;
   CpuSet_Zero(&cs);
@@ -299,7 +320,7 @@ WRes Thread_Create_With_Affinity(CThread *p, THREAD_FUNC_TYPE func, LPVOID param
 
 WRes Thread_Close(CThread *p)
 {
-  // Print("Thread_Close");
+  // Print("Thread_Close")
   int ret;
   if (!p->_created)
     return 0;
@@ -313,7 +334,7 @@ WRes Thread_Close(CThread *p)
 
 WRes Thread_Wait_Close(CThread *p)
 {
-  // Print("Thread_Wait_Close");
+  // Print("Thread_Wait_Close")
   void *thread_return;
   int ret;
   if (!p->_created)
@@ -330,8 +351,8 @@ WRes Thread_Wait_Close(CThread *p)
 
 static WRes Event_Create(CEvent *p, int manualReset, int signaled)
 {
-  RINOK(pthread_mutex_init(&p->_mutex, NULL));
-  RINOK(pthread_cond_init(&p->_cond, NULL));
+  RINOK(pthread_mutex_init(&p->_mutex, NULL))
+  RINOK(pthread_cond_init(&p->_cond, NULL))
   p->_manual_reset = manualReset;
   p->_state = (signaled ? True : False);
   p->_created = 1;
@@ -348,25 +369,32 @@ WRes AutoResetEvent_CreateNotSignaled(CAutoResetEvent *p)
   { return AutoResetEvent_Create(p, 0); }
 
 
+#if defined(Z7_LLVM_CLANG_VERSION) && (__clang_major__ == 13)
+// freebsd:
+#pragma GCC diagnostic ignored "-Wthread-safety-analysis"
+#endif
+
 WRes Event_Set(CEvent *p)
 {
-  RINOK(pthread_mutex_lock(&p->_mutex));
+  RINOK(pthread_mutex_lock(&p->_mutex))
   p->_state = True;
-  int res1 = pthread_cond_broadcast(&p->_cond);
-  int res2 = pthread_mutex_unlock(&p->_mutex);
-  return (res2 ? res2 : res1);
+  {
+    const int res1 = pthread_cond_broadcast(&p->_cond);
+    const int res2 = pthread_mutex_unlock(&p->_mutex);
+    return (res2 ? res2 : res1);
+  }
 }
 
 WRes Event_Reset(CEvent *p)
 {
-  RINOK(pthread_mutex_lock(&p->_mutex));
+  RINOK(pthread_mutex_lock(&p->_mutex))
   p->_state = False;
   return pthread_mutex_unlock(&p->_mutex);
 }
  
 WRes Event_Wait(CEvent *p)
 {
-  RINOK(pthread_mutex_lock(&p->_mutex));
+  RINOK(pthread_mutex_lock(&p->_mutex))
   while (p->_state == False)
   {
     // ETIMEDOUT
@@ -387,8 +415,8 @@ WRes Event_Close(CEvent *p)
     return 0;
   p->_created = 0;
   {
-    int res1 = pthread_mutex_destroy(&p->_mutex);
-    int res2 = pthread_cond_destroy(&p->_cond);
+    const int res1 = pthread_mutex_destroy(&p->_mutex);
+    const int res2 = pthread_cond_destroy(&p->_cond);
     return (res1 ? res1 : res2);
   }
 }
@@ -398,13 +426,34 @@ WRes Semaphore_Create(CSemaphore *p, UInt32 initCount, UInt32 maxCount)
 {
   if (initCount > maxCount || maxCount < 1)
     return EINVAL;
-  RINOK(pthread_mutex_init(&p->_mutex, NULL));
-  RINOK(pthread_cond_init(&p->_cond, NULL));
+  RINOK(pthread_mutex_init(&p->_mutex, NULL))
+  RINOK(pthread_cond_init(&p->_cond, NULL))
   p->_count = initCount;
   p->_maxCount = maxCount;
   p->_created = 1;
   return 0;
 }
+
+
+WRes Semaphore_OptCreateInit(CSemaphore *p, UInt32 initCount, UInt32 maxCount)
+{
+  if (Semaphore_IsCreated(p))
+  {
+    /*
+    WRes wres = Semaphore_Close(p);
+    if (wres != 0)
+      return wres;
+    */
+    if (initCount > maxCount || maxCount < 1)
+      return EINVAL;
+    // return EINVAL; // for debug
+    p->_count = initCount;
+    p->_maxCount = maxCount;
+    return 0;
+  }
+  return Semaphore_Create(p, initCount, maxCount);
+}
+
 
 WRes Semaphore_ReleaseN(CSemaphore *p, UInt32 releaseCount)
 {
@@ -414,7 +463,7 @@ WRes Semaphore_ReleaseN(CSemaphore *p, UInt32 releaseCount)
   if (releaseCount < 1)
     return EINVAL;
 
-  RINOK(pthread_mutex_lock(&p->_mutex));
+  RINOK(pthread_mutex_lock(&p->_mutex))
 
   newCount = p->_count + releaseCount;
   if (newCount > p->_maxCount)
@@ -424,13 +473,13 @@ WRes Semaphore_ReleaseN(CSemaphore *p, UInt32 releaseCount)
     p->_count = newCount;
     ret = pthread_cond_broadcast(&p->_cond);
   }
-  RINOK(pthread_mutex_unlock(&p->_mutex));
+  RINOK(pthread_mutex_unlock(&p->_mutex))
   return ret;
 }
 
 WRes Semaphore_Wait(CSemaphore *p)
 {
-  RINOK(pthread_mutex_lock(&p->_mutex));
+  RINOK(pthread_mutex_lock(&p->_mutex))
   while (p->_count < 1)
   {
     pthread_cond_wait(&p->_cond, &p->_mutex);
@@ -445,8 +494,8 @@ WRes Semaphore_Close(CSemaphore *p)
     return 0;
   p->_created = 0;
   {
-    int res1 = pthread_mutex_destroy(&p->_mutex);
-    int res2 = pthread_cond_destroy(&p->_cond);
+    const int res1 = pthread_mutex_destroy(&p->_mutex);
+    const int res2 = pthread_cond_destroy(&p->_cond);
     return (res1 ? res1 : res2);
   }
 }
@@ -455,7 +504,7 @@ WRes Semaphore_Close(CSemaphore *p)
 
 WRes CriticalSection_Init(CCriticalSection *p)
 {
-  // Print("CriticalSection_Init");
+  // Print("CriticalSection_Init")
   if (!p)
     return EINTR;
   return pthread_mutex_init(&p->_mutex, NULL);
@@ -463,7 +512,7 @@ WRes CriticalSection_Init(CCriticalSection *p)
 
 void CriticalSection_Enter(CCriticalSection *p)
 {
-  // Print("CriticalSection_Enter");
+  // Print("CriticalSection_Enter")
   if (p)
   {
     // int ret =
@@ -473,7 +522,7 @@ void CriticalSection_Enter(CCriticalSection *p)
 
 void CriticalSection_Leave(CCriticalSection *p)
 {
-  // Print("CriticalSection_Leave");
+  // Print("CriticalSection_Leave")
   if (p)
   {
     // int ret =
@@ -483,7 +532,7 @@ void CriticalSection_Leave(CCriticalSection *p)
 
 void CriticalSection_Delete(CCriticalSection *p)
 {
-  // Print("CriticalSection_Delete");
+  // Print("CriticalSection_Delete")
   if (p)
   {
     // int ret =
@@ -493,14 +542,40 @@ void CriticalSection_Delete(CCriticalSection *p)
 
 LONG InterlockedIncrement(LONG volatile *addend)
 {
-  // Print("InterlockedIncrement");
+  // Print("InterlockedIncrement")
   #ifdef USE_HACK_UNSAFE_ATOMIC
     LONG val = *addend + 1;
     *addend = val;
     return val;
   #else
+
+  #if defined(__clang__) && (__clang_major__ >= 8)
+    #pragma GCC diagnostic ignored "-Watomic-implicit-seq-cst"
+  #endif
     return __sync_add_and_fetch(addend, 1);
   #endif
 }
 
+LONG InterlockedDecrement(LONG volatile *addend)
+{
+  // Print("InterlockedDecrement")
+  #ifdef USE_HACK_UNSAFE_ATOMIC
+    LONG val = *addend - 1;
+    *addend = val;
+    return val;
+  #else
+    return __sync_sub_and_fetch(addend, 1);
+  #endif
+}
+
 #endif // _WIN32
+
+WRes AutoResetEvent_OptCreate_And_Reset(CAutoResetEvent *p)
+{
+  if (Event_IsCreated(p))
+    return Event_Reset(p);
+  return AutoResetEvent_CreateNotSignaled(p);
+}
+
+#undef PRF
+#undef Print

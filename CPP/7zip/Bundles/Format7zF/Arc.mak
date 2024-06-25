@@ -3,6 +3,7 @@ COMMON_OBJS = \
   $O\CrcReg.obj \
   $O\DynLimBuf.obj \
   $O\IntToString.obj \
+  $O\LzFindPrepare.obj \
   $O\MyMap.obj \
   $O\MyString.obj \
   $O\MyVector.obj \
@@ -14,6 +15,7 @@ COMMON_OBJS = \
   $O\StringToInt.obj \
   $O\UTFConvert.obj \
   $O\Wildcard.obj \
+  $O\Xxh64Reg.obj \
   $O\XzCrc64Init.obj \
   $O\XzCrc64Reg.obj \
 
@@ -23,6 +25,7 @@ WIN_OBJS = \
   $O\FileIO.obj \
   $O\FileName.obj \
   $O\PropVariant.obj \
+  $O\PropVariantConv.obj \
   $O\PropVariantUtils.obj \
   $O\Synchronization.obj \
   $O\System.obj \
@@ -52,6 +55,7 @@ WIN_OBJS = \
   $O\VirtThread.obj \
 
 AR_OBJS = \
+  $O\ApfsHandler.obj \
   $O\ApmHandler.obj \
   $O\ArHandler.obj \
   $O\ArjHandler.obj \
@@ -71,6 +75,7 @@ AR_OBJS = \
   $O\HandlerCont.obj \
   $O\HfsHandler.obj \
   $O\IhexHandler.obj \
+  $O\LpHandler.obj \
   $O\LzhHandler.obj \
   $O\LzmaHandler.obj \
   $O\MachoHandler.obj \
@@ -82,16 +87,19 @@ AR_OBJS = \
   $O\PpmdHandler.obj \
   $O\QcowHandler.obj \
   $O\RpmHandler.obj \
+  $O\SparseHandler.obj \
   $O\SplitHandler.obj \
   $O\SquashfsHandler.obj \
   $O\SwfHandler.obj \
   $O\UefiHandler.obj \
   $O\VdiHandler.obj \
   $O\VhdHandler.obj \
+  $O\VhdxHandler.obj \
   $O\VmdkHandler.obj \
   $O\XarHandler.obj \
   $O\XzHandler.obj \
   $O\ZHandler.obj \
+  $O\ZstdHandler.obj \
 
 AR_COMMON_OBJS = \
   $O\CoderMixer2.obj \
@@ -104,7 +112,6 @@ AR_COMMON_OBJS = \
   $O\OutStreamWithSha1.obj \
   $O\HandlerOut.obj \
   $O\ParseProperties.obj \
-
 
 7Z_OBJS = \
   $O\7zCompressionMode.obj \
@@ -228,7 +235,7 @@ COMPRESS_OBJS = \
   $O\ZlibDecoder.obj \
   $O\ZlibEncoder.obj \
   $O\ZDecoder.obj \
-
+  $O\ZstdDecoder.obj \
 
 CRYPTO_OBJS = \
   $O\7zAes.obj \
@@ -245,7 +252,6 @@ CRYPTO_OBJS = \
   $O\WzAes.obj \
   $O\ZipCrypto.obj \
   $O\ZipStrong.obj \
-
 
 C_OBJS = \
   $O\7zBuf2.obj \
@@ -278,15 +284,19 @@ C_OBJS = \
   $O\Ppmd8Dec.obj \
   $O\Ppmd8Enc.obj \
   $O\Sort.obj \
+  $O\SwapBytes.obj \
   $O\Threads.obj \
+  $O\Xxh64.obj \
   $O\Xz.obj \
   $O\XzDec.obj \
   $O\XzEnc.obj \
   $O\XzIn.obj \
+  $O\ZstdDec.obj \
 
 !include "../../Aes.mak"
 !include "../../Crc.mak"
 !include "../../Crc64.mak"
+!include "../../LzFindOpt.mak"
 !include "../../LzmaDec.mak"
 !include "../../Sha1.mak"
 !include "../../Sha256.mak"

@@ -2,12 +2,9 @@
 
 #include "StdAfx.h"
 
-#include "../../../../C/CpuArch.h"
-
 // #include <stdio.h>
 
 #ifndef _WIN32
-
 #define USE_POSIX_TIME
 #define USE_POSIX_TIME2
 #endif // _WIN32
@@ -31,33 +28,37 @@
 #else
 #include <stdlib.h>
 #endif
+#define BENCH_ALLOCA_VALUE(index) (((index) * 64 * 21) & 0x7FF)
 #endif
 
 #include "../../../../C/7zCrc.h"
 #include "../../../../C/RotateDefs.h"
+#include "../../../../C/CpuArch.h"
 
-#ifndef _7ZIP_ST
+#ifndef Z7_ST
 #include "../../../Windows/Synchronization.h"
 #include "../../../Windows/Thread.h"
 #endif
 
-#include "../../../Windows/FileIO.h"
 #include "../../../Windows/FileFind.h"
+#include "../../../Windows/FileIO.h"
 #include "../../../Windows/SystemInfo.h"
 
-#include "../../../Common/IntToString.h"
 #include "../../../Common/MyBuffer2.h"
+#include "../../../Common/IntToString.h"
 #include "../../../Common/StringConvert.h"
 #include "../../../Common/StringToInt.h"
+#include "../../../Common/Wildcard.h"
 
 #include "../../Common/MethodProps.h"
+#include "../../Common/StreamObjects.h"
 #include "../../Common/StreamUtils.h"
 
 #include "Bench.h"
 
 using namespace NWindows;
 
-#ifndef _7ZIP_ST
+#ifndef Z7_ST
 static const UInt32 k_LZMA = 0x030101;
 #endif
 
@@ -87,20 +88,30 @@ static void SetComplexCommandsMs(UInt32 complexInMs,
   }
 }
 
+// const UInt64 kBenchmarkUsageMult = 1000000; // for debug
+static const unsigned kBenchmarkUsageMultBits = 16;
+static const UInt64 kBenchmarkUsageMult = 1 << kBenchmarkUsageMultBits;
+
+UInt64 Benchmark_GetUsage_Percents(UInt64 usage)
+{
+  return (100 * usage + kBenchmarkUsageMult / 2) / kBenchmarkUsageMult;
+}
+
 static const unsigned kNumHashDictBits = 17;
 static const UInt32 kFilterUnpackSize = (47 << 10); // + 5; // for test
 
-static const unsigned kOldLzmaDictBits = 30;
+static const unsigned kOldLzmaDictBits = 32;
 
-static const UInt32 kAdditionalSize = (1 << 16);
-static const UInt32 kCompressedAdditionalSize = (1 << 10);
-static const UInt32 kMaxLzmaPropSize = 5;
+// static const size_t kAdditionalSize = (size_t)1 << 32; // for debug
+static const size_t kAdditionalSize = (size_t)1 << 16;
+static const size_t kCompressedAdditionalSize = 1 << 10;
 
+static const UInt32 kMaxMethodPropSize = 1 << 6;
 
 
 #define ALLOC_WITH_HRESULT(_buffer_, _size_) \
   { (_buffer_)->Alloc(_size_); \
-  if (!(_buffer_)->IsAllocated()) return E_OUTOFMEMORY; }
+  if (_size_ && !(_buffer_)->IsAllocated()) return E_OUTOFMEMORY; }
 
 
 class CBaseRandomGenerator
@@ -111,50 +122,58 @@ class CBaseRandomGenerator
 public:
   CBaseRandomGenerator(UInt32 salt = 0): Salt(salt) { Init(); }
   void Init() { A1 = 362436069; A2 = 521288629;}
-  MY_FORCE_INLINE
+  Z7_FORCE_INLINE
   UInt32 GetRnd()
   {
+#if 0
+    // for debug:
+    return 0x0c080400;
+    // return 0;
+#else
     return Salt ^
     (
       ((A1 = 36969 * (A1 & 0xffff) + (A1 >> 16)) << 16) +
       ((A2 = 18000 * (A2 & 0xffff) + (A2 >> 16)) )
     );
+#endif
   }
 };
 
 
-MY_NO_INLINE
-static void RandGen(Byte *buf, size_t size)
+static const size_t k_RandBuf_AlignMask = 4 - 1;
+
+Z7_NO_INLINE
+static void RandGen_BufAfterPad(Byte *buf, size_t size)
 {
   CBaseRandomGenerator RG;
-  const size_t size4 = size & ~((size_t)3);
-  size_t i;
-  for (i = 0; i < size4; i += 4)
+  for (size_t i = 0; i < size; i += 4)
   {
     const UInt32 v = RG.GetRnd();
-    SetUi32(buf + i, v);
+    SetUi32a(buf + i, v)
   }
+  /*
   UInt32 v = RG.GetRnd();
   for (; i < size; i++)
   {
     buf[i] = (Byte)v;
     v >>= 8;
   }
+  */
 }
 
 
-class CBenchRandomGenerator: public CAlignedBuffer
+class CBenchRandomGenerator: public CMidAlignedBuffer
 {
   static UInt32 GetVal(UInt32 &res, unsigned numBits)
   {
-    UInt32 val = res & (((UInt32)1 << numBits) - 1);
+    const UInt32 val = res & (((UInt32)1 << numBits) - 1);
     res >>= numBits;
     return val;
   }
   
   static UInt32 GetLen(UInt32 &r)
   {
-    UInt32 len = GetVal(r, 2);
+    const unsigned len = (unsigned)GetVal(r, 2);
     return GetVal(r, 1 + len);
   }
 
@@ -172,14 +191,21 @@ public:
   void GenerateLz(unsigned dictBits, UInt32 salt)
   {
     CBaseRandomGenerator rg(salt);
-    UInt32 pos = 0;
-    UInt32 rep0 = 1;
+    size_t pos = 0;
+    size_t rep0 = 1;
     const size_t bufSize = Size();
     Byte *buf = (Byte *)*this;
     unsigned posBits = 1;
+
+    // printf("\n dictBits = %d\n", (UInt32)dictBits);
+    // printf("\n bufSize = 0x%p\n", (const void *)bufSize);
     
     while (pos < bufSize)
     {
+      /*
+      if (pos >= ((UInt32)1 << 31))
+        printf(" %x\n", pos);
+      */
       UInt32 r = rg.GetRnd();
       if (GetVal(r, 1) == 0 || pos < 1024)
         buf[pos++] = (Byte)(r & 0xFF);
@@ -192,7 +218,7 @@ public:
         {
           len += GetLen(r);
 
-          while (((UInt32)1 << posBits) < pos)
+          while (((size_t)1 << posBits) < pos)
             posBits++;
 
           unsigned numBitsMax = dictBits;
@@ -206,11 +232,12 @@ public:
 
           for (;;)
           {
-            UInt32 ppp = GetVal(r, numLogBits) + kAddBits;
+            const UInt32 ppp = GetVal(r, numLogBits) + kAddBits;
             r = rg.GetRnd();
             if (ppp > numBitsMax)
               continue;
-            rep0 = GetVal(r, ppp);
+            // rep0 = GetVal(r, ppp);
+            rep0 = r & (((size_t)1 << ppp) - 1);
             if (rep0 < pos)
               break;
             r = rg.GetRnd();
@@ -218,10 +245,11 @@ public:
           rep0++;
         }
 
+        // len *= 300; // for debug
         {
-          UInt32 rem = (UInt32)bufSize - pos;
+          const size_t rem = bufSize - pos;
           if (len > rem)
-            len = rem;
+            len = (UInt32)rem;
         }
         Byte *dest = buf + pos;
         const Byte *src = dest - rep0;
@@ -230,20 +258,19 @@ public:
           *dest++ = *src++;
       }
     }
+    // printf("\n CRC = %x\n", CrcCalc(buf, bufSize));
   }
 };
 
 
-class CBenchmarkInStream:
-  public ISequentialInStream,
-  public CMyUnknownImp
-{
+Z7_CLASS_IMP_NOQIB_1(
+  CBenchmarkInStream
+  , ISequentialInStream
+)
   const Byte *Data;
   size_t Pos;
   size_t Size;
-
 public:
-  MY_UNKNOWN_IMP
   void Init(const Byte *data, size_t size)
   {
     Data = data;
@@ -251,10 +278,9 @@ public:
     Pos = 0;
   }
   bool WasFinished() const { return Pos == Size; }
-  STDMETHOD(Read)(void *data, UInt32 size, UInt32 *processedSize);
 };
 
-STDMETHODIMP CBenchmarkInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
+Z7_COM7F_IMF(CBenchmarkInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
 {
   const UInt32 kMaxBlockSize = (1 << 20);
   if (size > kMaxBlockSize)
@@ -263,7 +289,7 @@ STDMETHODIMP CBenchmarkInStream::Read(void *data, UInt32 size, UInt32 *processed
   if (size > remain)
     size = (UInt32)remain;
 
-  if (size != 0)
+  if (size)
     memcpy(data, Data + Pos, size);
 
   Pos += size;
@@ -272,11 +298,14 @@ STDMETHODIMP CBenchmarkInStream::Read(void *data, UInt32 size, UInt32 *processed
   return S_OK;
 }
   
-class CBenchmarkOutStream:
+
+class CBenchmarkOutStream Z7_final:
   public ISequentialOutStream,
-  public CAlignedBuffer,
-  public CMyUnknownImp
+  public CMyUnknownImp,
+  public CMidAlignedBuffer
 {
+  Z7_COM_UNKNOWN_IMP_0
+  Z7_IFACE_COM7_IMP(ISequentialOutStream)
   // bool _overflow;
 public:
   size_t Pos;
@@ -304,13 +333,12 @@ public:
     Crc = CrcUpdate(Crc, data, size);
   }
 
-  // void Print() { printf("\n%8d %8d\n", (unsigned)BufferSize, (unsigned)Pos); }
+  size_t GetPos() const { return Pos; }
 
-  MY_UNKNOWN_IMP
-  STDMETHOD(Write)(const void *data, UInt32 size, UInt32 *processedSize);
+  // void Print() { printf("\n%8d %8d\n", (unsigned)BufferSize, (unsigned)Pos); }
 };
 
-STDMETHODIMP CBenchmarkOutStream::Write(const void *data, UInt32 size, UInt32 *processedSize)
+Z7_COM7F_IMF(CBenchmarkOutStream::Write(const void *data, UInt32 size, UInt32 *processedSize))
 {
   size_t curSize = Size() - Pos;
   if (curSize > size)
@@ -334,27 +362,24 @@ STDMETHODIMP CBenchmarkOutStream::Write(const void *data, UInt32 size, UInt32 *p
 }
   
 
-class CCrcOutStream:
-  public ISequentialOutStream,
-  public CMyUnknownImp
-{
+Z7_CLASS_IMP_NOQIB_1(
+  CCrcOutStream
+  , ISequentialOutStream
+)
 public:
   bool CalcCrc;
   UInt32 Crc;
   UInt64 Pos;
   
-  MY_UNKNOWN_IMP
-    
-  CCrcOutStream(): CalcCrc(true) {};
+  CCrcOutStream(): CalcCrc(true) {}
   void Init() { Crc = CRC_INIT_VAL; Pos = 0; }
   void Calc(const void *data, size_t size)
   {
     Crc = CrcUpdate(Crc, data, size);
   }
-  STDMETHOD(Write)(const void *data, UInt32 size, UInt32 *processedSize);
 };
 
-STDMETHODIMP CCrcOutStream::Write(const void *data, UInt32 size, UInt32 *processedSize)
+Z7_COM7F_IMF(CCrcOutStream::Write(const void *data, UInt32 size, UInt32 *processedSize))
 {
   if (CalcCrc)
     Calc(data, size);
@@ -371,7 +396,7 @@ static UInt64 GetTimeCount()
   #ifdef USE_POSIX_TIME
   #ifdef USE_POSIX_TIME2
   timeval v;
-  if (gettimeofday(&v, 0) == 0)
+  if (gettimeofday(&v, NULL) == 0)
     return (UInt64)(v.tv_sec) * 1000000 + (UInt64)v.tv_usec;
   return (UInt64)time(NULL) * 1000000;
   #else
@@ -508,9 +533,9 @@ static UInt64 GetUserFreq()
   #endif
 }
 
-class CBenchProgressStatus
+class CBenchProgressStatus Z7_final
 {
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   NSynchronization::CCriticalSection CS;
   #endif
 public:
@@ -518,14 +543,14 @@ public:
   bool EncodeMode;
   void SetResult(HRESULT res)
   {
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     NSynchronization::CCriticalSectionLock lock(CS);
     #endif
     Res = res;
   }
   HRESULT GetResult()
   {
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     NSynchronization::CCriticalSectionLock lock(CS);
     #endif
     return Res;
@@ -557,27 +582,44 @@ void CBenchInfoCalc::SetFinishTime(CBenchInfo &dest)
   dest.UserTime = UserTime.GetUserTime();
 }
 
-class CBenchProgressInfo:
+class CBenchProgressInfo Z7_final:
   public ICompressProgressInfo,
   public CMyUnknownImp,
   public CBenchInfoCalc
 {
+  Z7_COM_UNKNOWN_IMP_0
+  Z7_IFACE_COM7_IMP(ICompressProgressInfo)
 public:
   CBenchProgressStatus *Status;
   IBenchCallback *Callback;
 
   CBenchProgressInfo(): Callback(NULL) {}
-  MY_UNKNOWN_IMP
-  STDMETHOD(SetRatioInfo)(const UInt64 *inSize, const UInt64 *outSize);
 };
 
-STDMETHODIMP CBenchProgressInfo::SetRatioInfo(const UInt64 *inSize, const UInt64 *outSize)
+
+Z7_COM7F_IMF(CBenchProgressInfo::SetRatioInfo(const UInt64 *inSize, const UInt64 *outSize))
 {
   HRESULT res = Status->GetResult();
   if (res != S_OK)
     return res;
   if (!Callback)
     return res;
+
+  /*
+  static UInt64 inSizePrev = 0;
+  static UInt64 outSizePrev = 0;
+  UInt64 delta1 = 0, delta2 = 0, val1 = 0, val2 = 0;
+  if (inSize)   { val1 = *inSize;  delta1 = val1 - inSizePrev;  inSizePrev  = val1; }
+  if (outSize)  { val2 = *outSize; delta2 = val2 - outSizePrev; outSizePrev = val2;  }
+  UInt64 percents = delta2 * 1000;
+  if (delta1 != 0)
+    percents /= delta1;
+  printf("=== %7d %7d     %7d %7d  ratio = %4d\n",
+      (unsigned)(val1 >> 10), (unsigned)(delta1 >> 10),
+      (unsigned)(val2 >> 10), (unsigned)(delta2 >> 10),
+      (unsigned)percents);
+  */
+
   CBenchInfo info;
   SetFinishTime(info);
   if (Status->EncodeMode)
@@ -599,23 +641,72 @@ STDMETHODIMP CBenchProgressInfo::SetRatioInfo(const UInt64 *inSize, const UInt64
 
 static const unsigned kSubBits = 8;
 
-static UInt32 GetLogSize(UInt32 size)
+static unsigned GetLogSize(UInt64 size)
 {
-  for (unsigned i = kSubBits; i < 32; i++)
-    for (UInt32 j = 0; j < (1 << kSubBits); j++)
-      if (size <= (((UInt32)1) << i) + (j << (i - kSubBits)))
-        return (i << kSubBits) + j;
-  return (32 << kSubBits);
+  unsigned i = 0;
+  for (;;)
+  {
+    i++;  size >>= 1;  if (size == 0) break;
+  }
+  return i;
 }
 
-static void NormalizeVals(UInt64 &v1, UInt64 &v2)
+
+static UInt32 GetLogSize_Sub(UInt64 size)
 {
-  while (v1 > 1000000)
-  {
-    v1 >>= 1;
-    v2 >>= 1;
-  }
+  if (size <= 1)
+    return 0;
+  const unsigned i = GetLogSize(size) - 1;
+  UInt32 v;
+  if (i <= kSubBits)
+    v = (UInt32)(size) << (kSubBits - i);
+  else
+    v = (UInt32)(size >> (i - kSubBits));
+  return ((UInt32)i << kSubBits) + (v & (((UInt32)1 << kSubBits) - 1));
 }
+
+
+static UInt64 Get_UInt64_from_double(double v)
+{
+  const UInt64 kMaxVal = (UInt64)1 << 62;
+  if (v > (double)(Int64)kMaxVal)
+    return kMaxVal;
+  return (UInt64)v;
+}
+
+static UInt64 MyMultDiv64(UInt64 m1, UInt64 m2, UInt64 d)
+{
+  if (d == 0)
+    d = 1;
+  const double v =
+      (double)(Int64)m1 *
+      (double)(Int64)m2 /
+      (double)(Int64)d;
+  return Get_UInt64_from_double(v);
+  /*
+  unsigned n1 = GetLogSize(m1);
+  unsigned n2 = GetLogSize(m2);
+  while (n1 + n2 > 64)
+  {
+    if (n1 >= n2)
+    {
+      m1 >>= 1;
+      n1--;
+    }
+    else
+    {
+      m2 >>= 1;
+      n2--;
+    }
+    d >>= 1;
+  }
+
+  if (d == 0)
+    d = 1;
+  return m1 * m2 / d;
+  */
+}
+
 
 UInt64 CBenchInfo::GetUsage() const
 {
@@ -623,54 +714,68 @@ UInt64 CBenchInfo::GetUsage() const
   UInt64 userFreq = UserFreq;
   UInt64 globalTime = GlobalTime;
   UInt64 globalFreq = GlobalFreq;
-  NormalizeVals(userTime, userFreq);
-  NormalizeVals(globalFreq, globalTime);
+
   if (userFreq == 0)
     userFreq = 1;
   if (globalTime == 0)
     globalTime = 1;
-  return userTime * globalFreq * 1000000 / userFreq / globalTime;
+
+  const double v =
+        ((double)(Int64)userTime / (double)(Int64)userFreq)
+      * ((double)(Int64)globalFreq / (double)(Int64)globalTime)
+      * (double)(Int64)kBenchmarkUsageMult;
+  return Get_UInt64_from_double(v);
+  /*
+  return MyMultDiv64(
+        MyMultDiv64(kBenchmarkUsageMult, userTime, userFreq),
+        globalFreq, globalTime);
+  */
 }
+
 
 UInt64 CBenchInfo::GetRatingPerUsage(UInt64 rating) const
 {
-  UInt64 userTime = UserTime;
-  UInt64 userFreq = UserFreq;
-  UInt64 globalTime = GlobalTime;
-  UInt64 globalFreq = GlobalFreq;
-  NormalizeVals(userFreq, userTime);
-  NormalizeVals(globalTime, globalFreq);
-  if (globalFreq == 0)
-    globalFreq = 1;
-  if (userTime == 0)
+  if (UserTime == 0)
   {
     return 0;
     // userTime = 1;
   }
-  return userFreq * globalTime / globalFreq * rating / userTime;
+  UInt64 globalFreq = GlobalFreq;
+  if (globalFreq == 0)
+    globalFreq = 1;
+
+  const double v =
+        ((double)(Int64)GlobalTime / (double)(Int64)globalFreq)
+      * ((double)(Int64)UserFreq  / (double)(Int64)UserTime)
+      * (double)(Int64)rating;
+  return Get_UInt64_from_double(v);
+  /*
+  return MyMultDiv64(
+        MyMultDiv64(rating, UserFreq, UserTime),
+        GlobalTime, globalFreq);
+  */
 }
 
-static UInt64 MyMultDiv64(UInt64 value, UInt64 elapsedTime, UInt64 freq)
+
+UInt64 CBenchInfo::GetSpeed(UInt64 numUnits) const
 {
-  UInt64 elTime = elapsedTime;
-  NormalizeVals(freq, elTime);
-  if (elTime == 0)
-    elTime = 1;
-  return value * freq / elTime;
+  return MyMultDiv64(numUnits, GlobalFreq, GlobalTime);
 }
 
-UInt64 CBenchInfo::GetSpeed(UInt64 numCommands) const
+static UInt64 GetNumCommands_from_Size_and_Complexity(UInt64 size, Int32 complexity)
 {
-  return MyMultDiv64(numCommands, GlobalTime, GlobalFreq);
+  return complexity >= 0 ?
+      size * (UInt32)complexity :
+      size / (UInt32)(-complexity);
 }
 
 struct CBenchProps
 {
   bool LzmaRatingMode;
   
-  UInt32 EncComplex;
-  UInt32 DecComplexCompr;
-  UInt32 DecComplexUnc;
+  Int32 EncComplex;
+  Int32 DecComplexCompr;
+  Int32 DecComplexUnc;
 
   unsigned KeySize;
 
@@ -681,21 +786,23 @@ struct CBenchProps
 
   void SetLzmaCompexity();
 
-  UInt64 GeComprCommands(UInt64 unpackSize)
+  UInt64 GetNumCommands_Enc(UInt64 unpackSize) const
   {
     const UInt32 kMinSize = 100;
     if (unpackSize < kMinSize)
       unpackSize = kMinSize;
-    return unpackSize * EncComplex;
+    return GetNumCommands_from_Size_and_Complexity(unpackSize, EncComplex);
   }
 
-  UInt64 GeDecomprCommands(UInt64 packSize, UInt64 unpackSize)
+  UInt64 GetNumCommands_Dec(UInt64 packSize, UInt64 unpackSize) const
   {
-    return (packSize * DecComplexCompr + unpackSize * DecComplexUnc);
+    return
+        GetNumCommands_from_Size_and_Complexity(packSize, DecComplexCompr) +
+        GetNumCommands_from_Size_and_Complexity(unpackSize, DecComplexUnc);
   }
 
-  UInt64 GetCompressRating(UInt32 dictSize, UInt64 elapsedTime, UInt64 freq, UInt64 size);
-  UInt64 GetDecompressRating(UInt64 elapsedTime, UInt64 freq, UInt64 outSize, UInt64 inSize, UInt64 numIterations);
+  UInt64 GetRating_Enc(UInt64 dictSize, UInt64 elapsedTime, UInt64 freq, UInt64 size) const;
+  UInt64 GetRating_Dec(UInt64 elapsedTime, UInt64 freq, UInt64 outSize, UInt64 inSize, UInt64 numIterations) const;
 };
 
 void CBenchProps::SetLzmaCompexity()
@@ -706,42 +813,54 @@ void CBenchProps::SetLzmaCompexity()
   LzmaRatingMode = true;
 }
 
-UInt64 CBenchProps::GetCompressRating(UInt32 dictSize, UInt64 elapsedTime, UInt64 freq, UInt64 size)
+UInt64 CBenchProps::GetRating_Enc(UInt64 dictSize, UInt64 elapsedTime, UInt64 freq, UInt64 size) const
 {
   if (dictSize < (1 << kBenchMinDicLogSize))
     dictSize = (1 << kBenchMinDicLogSize);
-  UInt64 encComplex = EncComplex;
+  Int32 encComplex = EncComplex;
   if (LzmaRatingMode)
   {
-    UInt64 t = GetLogSize(dictSize) - (kBenchMinDicLogSize << kSubBits);
+    /*
+    for (UInt64 uu = 0; uu < (UInt64)0xf << 60;)
+    {
+      unsigned rr = GetLogSize_Sub(uu);
+      printf("\n%16I64x , log = %4x", uu, rr);
+      uu += 1;
+      uu += uu / 50;
+    }
+    */
+    // throw 1;
+    const UInt32 t = GetLogSize_Sub(dictSize) - (kBenchMinDicLogSize << kSubBits);
     encComplex = 870 + ((t * t * 5) >> (2 * kSubBits));
   }
-  UInt64 numCommands = (UInt64)size * encComplex;
-  return MyMultDiv64(numCommands, elapsedTime, freq);
+  const UInt64 numCommands = GetNumCommands_from_Size_and_Complexity(size, encComplex);
+  return MyMultDiv64(numCommands, freq, elapsedTime);
 }
 
-UInt64 CBenchProps::GetDecompressRating(UInt64 elapsedTime, UInt64 freq, UInt64 outSize, UInt64 inSize, UInt64 numIterations)
+UInt64 CBenchProps::GetRating_Dec(UInt64 elapsedTime, UInt64 freq, UInt64 outSize, UInt64 inSize, UInt64 numIterations) const
 {
-  UInt64 numCommands = (inSize * DecComplexCompr + outSize * DecComplexUnc) * numIterations;
-  return MyMultDiv64(numCommands, elapsedTime, freq);
+  const UInt64 numCommands = GetNumCommands_Dec(inSize, outSize) * numIterations;
+  return MyMultDiv64(numCommands, freq, elapsedTime);
 }
 
-UInt64 GetCompressRating(UInt32 dictSize, UInt64 elapsedTime, UInt64 freq, UInt64 size)
-{
-  CBenchProps props;
-  props.SetLzmaCompexity();
-  return props.GetCompressRating(dictSize, elapsedTime, freq, size);
-}
 
-UInt64 GetDecompressRating(UInt64 elapsedTime, UInt64 freq, UInt64 outSize, UInt64 inSize, UInt64 numIterations)
+
+UInt64 CBenchInfo::GetRating_LzmaEnc(UInt64 dictSize) const
 {
   CBenchProps props;
   props.SetLzmaCompexity();
-  return props.GetDecompressRating(elapsedTime, freq, outSize, inSize, numIterations);
+  return props.GetRating_Enc(dictSize, GlobalTime, GlobalFreq, UnpackSize * NumIterations);
+}
+
+UInt64 CBenchInfo::GetRating_LzmaDec() const
+{
+  CBenchProps props;
+  props.SetLzmaCompexity();
+  return props.GetRating_Dec(GlobalTime, GlobalFreq, UnpackSize, PackSize, NumIterations);
 }
 
 
-#ifndef _7ZIP_ST
+#ifndef Z7_ST
 
 #define NUM_CPU_LEVELS_MAX 3
 
@@ -758,7 +877,7 @@ struct CAffinityMode
   DWORD_PTR GetAffinityMask(UInt32 bundleIndex, CCpuSet *cpuSet) const;
   bool NeedAffinity() const { return NumBundleThreads != 0; }
 
-  WRes CreateThread_WithAffinity(NWindows::CThread &thread, THREAD_FUNC_RET_TYPE (THREAD_FUNC_CALL_TYPE *startAddress)(void *), LPVOID parameter, UInt32 bundleIndex) const
+  WRes CreateThread_WithAffinity(NWindows::CThread &thread, THREAD_FUNC_TYPE startAddress, LPVOID parameter, UInt32 bundleIndex) const
   {
     if (NeedAffinity())
     {
@@ -880,11 +999,22 @@ struct CBenchSyncCommon
 
 
 
-struct CEncoderInfo;
-
-struct CEncoderInfo
+enum E_CheckCrcMode
 {
-  #ifndef _7ZIP_ST
+  k_CheckCrcMode_Never = 0,
+  k_CheckCrcMode_Always = 1,
+  k_CheckCrcMode_FirstPass = 2
+};
+
+class CEncoderInfo;
+
+class CEncoderInfo Z7_final
+{
+  Z7_CLASS_NO_COPY(CEncoderInfo)
+
+public:
+
+  #ifndef Z7_ST
   NWindows::CThread thread[2];
   NSynchronization::CManualResetEvent ReadyEvent;
   UInt32 NumDecoderSubThreads;
@@ -892,6 +1022,7 @@ struct CEncoderInfo
   UInt32 EncoderIndex;
   UInt32 NumEncoderInternalThreads;
   CAffinityMode AffinityMode;
+  bool IsGlobalMtMode; // if more than one benchmark encoder threads
   #endif
 
   CMyComPtr<ICompressCoder> _encoder;
@@ -912,14 +1043,17 @@ struct CEncoderInfo
   
   HRESULT Set_Key_and_IV(ICryptoProperties *cp)
   {
-    RINOK(cp->SetKey(_key, KeySize));
+    RINOK(cp->SetKey(_key, KeySize))
     return cp->SetInitVector(_iv, sizeof(_iv));
   }
 
   Byte _psw[16];
   
-  bool CheckCrc_Enc;
-  bool CheckCrc_Dec;
+  bool CheckCrc_Enc;    /* = 1, if we want to check packed data crcs after each pass
+                                used for filter and usual coders */
+  bool UseRealData_Enc; /* = 1, if we want to use only original data for each pass
+                                used only for filter */
+  E_CheckCrcMode CheckCrcMode_Dec;
 
   struct CDecoderInfo
   {
@@ -949,8 +1083,11 @@ struct CEncoderInfo
   const Byte *fileData;
   CBenchRandomGenerator rg;
 
-  CAlignedBuffer rgCopy; // it must be 16-byte aligned !!!
-  CBenchmarkOutStream *propStreamSpec;
+  CMidAlignedBuffer rgCopy; // it must be 16-byte aligned !!!
+  
+  // CBenchmarkOutStream *propStreamSpec;
+  Byte propsData[kMaxMethodPropSize];
+  CBufPtrSeqOutStream *propStreamSpec;
   CMyComPtr<ISequentialOutStream> propStream;
 
   unsigned generateDictBits;
@@ -964,13 +1101,15 @@ struct CEncoderInfo
   HRESULT Decode(UInt32 decoderIndex);
 
   CEncoderInfo():
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     Common(NULL),
+    IsGlobalMtMode(true),
     #endif
     Salt(0),
     KeySize(0),
     CheckCrc_Enc(true),
-    CheckCrc_Dec(true),
+    UseRealData_Enc(true),
+    CheckCrcMode_Dec(k_CheckCrcMode_Always),
     outStreamSpec(NULL),
     callback(NULL),
     printCallback(NULL),
@@ -978,7 +1117,7 @@ struct CEncoderInfo
     propStreamSpec(NULL)
     {}
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   
   static THREAD_FUNC_DECL EncodeThreadFunction(void *param)
   {
@@ -1000,7 +1139,7 @@ struct CEncoderInfo
     if (res != S_OK)
       encoder->progressInfoSpec[0]->Status->SetResult(res);
     encoder->ReadyEvent.Set();
-    return 0;
+    return THREAD_FUNC_RET_ZERO;
   }
   
   static THREAD_FUNC_DECL DecodeThreadFunction(void *param)
@@ -1009,11 +1148,12 @@ struct CEncoderInfo
     
     #ifdef USE_ALLOCA
     alloca(decoder->AllocaSize);
+    // printf("\nalloca=%d\n", (unsigned)decoder->AllocaSize);
     #endif
     
     CEncoderInfo *encoder = decoder->Encoder;
     encoder->Results[decoder->DecoderIndex] = encoder->Decode(decoder->DecoderIndex);
-    return 0;
+    return THREAD_FUNC_RET_ZERO;
   }
 
   HRESULT CreateEncoderThread()
@@ -1055,41 +1195,60 @@ struct CEncoderInfo
 };
 
 
+
+
+static size_t GetBenchCompressedSize(size_t bufferSize)
+{
+  return kCompressedAdditionalSize + bufferSize + bufferSize / 16;
+  // kBufferSize / 2;
+}
+
+
 HRESULT CEncoderInfo::Generate()
 {
   const COneMethodInfo &method = _method;
 
   // we need extra space, if input data is already compressed
-  const size_t kCompressedBufferSize =
-      kCompressedAdditionalSize +
-      kBufferSize + kBufferSize / 16;
-      // kBufferSize / 2;
+  const size_t kCompressedBufferSize = _encoderFilter ?
+      kBufferSize :
+      GetBenchCompressedSize(kBufferSize);
 
   if (kCompressedBufferSize < kBufferSize)
     return E_FAIL;
 
   uncompressedDataPtr = fileData;
-  
-  if (!fileData)
+  if (fileData)
   {
-    ALLOC_WITH_HRESULT(&rg, kBufferSize);
-    
+    #if !defined(Z7_ST)
+    if (IsGlobalMtMode)
+    {
+      /* we copy the data to local buffer of thread to eliminate
+         using of shared buffer by different threads */
+      ALLOC_WITH_HRESULT(&rg, kBufferSize)
+      memcpy((Byte *)rg, fileData, kBufferSize);
+      uncompressedDataPtr = (const Byte *)rg;
+    }
+    #endif
+  }
+  else
+  {
+    ALLOC_WITH_HRESULT(&rg, kBufferSize)
     // DWORD ttt = GetTickCount();
     if (generateDictBits == 0)
       rg.GenerateSimpleRandom(Salt);
     else
+    {
+      if (generateDictBits >= sizeof(size_t) * 8
+          && kBufferSize > ((size_t)1 << (sizeof(size_t) * 8 - 1)))
+        return E_INVALIDARG;
       rg.GenerateLz(generateDictBits, Salt);
+      // return E_ABORT; // for debug
+    }
     // printf("\n%d\n            ", GetTickCount() - ttt);
 
     crc = CrcCalc((const Byte *)rg, rg.Size());
     uncompressedDataPtr = (const Byte *)rg;
   }
-  
-  if (_encoderFilter)
-  {
-    ALLOC_WITH_HRESULT(&rgCopy, kBufferSize);
-  }
-
 
   if (!outStream)
   {
@@ -1099,13 +1258,23 @@ HRESULT CEncoderInfo::Generate()
 
   ALLOC_WITH_HRESULT(outStreamSpec, kCompressedBufferSize)
 
+  if (_encoderFilter)
+  {
+    /* we try to reduce the number of memcpy() in main encoding loop.
+       so we copy data to temp buffers here */
+    ALLOC_WITH_HRESULT(&rgCopy, kBufferSize)
+    memcpy((Byte *)*outStreamSpec, uncompressedDataPtr, kBufferSize);
+    memcpy((Byte *)rgCopy, uncompressedDataPtr, kBufferSize);
+  }
+
   if (!propStream)
   {
-    propStreamSpec = new CBenchmarkOutStream;
+    propStreamSpec = new CBufPtrSeqOutStream; // CBenchmarkOutStream;
     propStream = propStreamSpec;
   }
-  ALLOC_WITH_HRESULT(propStreamSpec, kMaxLzmaPropSize);
-  propStreamSpec->Init(true, false);
+  // ALLOC_WITH_HRESULT_2(propStreamSpec, kMaxMethodPropSize);
+  // propStreamSpec->Init(true, false);
+  propStreamSpec->Init(propsData, sizeof(propsData));
   
  
   CMyComPtr<IUnknown> coder;
@@ -1123,7 +1292,7 @@ HRESULT CEncoderInfo::Generate()
       /* in posix new thread uses same affinity as parent thread,
          so we don't need to send affinity to coder in posix */
       UInt64 affMask;
-      #if !defined(_7ZIP_ST) && defined(_WIN32)
+      #if !defined(Z7_ST) && defined(_WIN32)
       {
         CCpuSet cpuSet;
         affMask = AffinityMode.GetAffinityMask(EncoderIndex, &cpuSet);
@@ -1134,7 +1303,7 @@ HRESULT CEncoderInfo::Generate()
       // affMask <<= 3; // debug line: to test no affinity in coder;
       // affMask = 0;
 
-      RINOK(method.SetCoderProps_DSReduce_Aff(scp, &reduceSize, (affMask != 0 ? &affMask : NULL)));
+      RINOK(method.SetCoderProps_DSReduce_Aff(scp, &reduceSize, (affMask != 0 ? &affMask : NULL)))
     }
     else
     {
@@ -1146,7 +1315,7 @@ HRESULT CEncoderInfo::Generate()
     coder.QueryInterface(IID_ICompressWriteCoderProperties, &writeCoderProps);
     if (writeCoderProps)
     {
-      RINOK(writeCoderProps->WriteCoderProperties(propStream));
+      RINOK(writeCoderProps->WriteCoderProperties(propStream))
     }
 
     {
@@ -1154,7 +1323,7 @@ HRESULT CEncoderInfo::Generate()
       coder.QueryInterface(IID_ICryptoSetPassword, &sp);
       if (sp)
       {
-        RINOK(sp->CryptoSetPassword(_psw, sizeof(_psw)));
+        RINOK(sp->CryptoSetPassword(_psw, sizeof(_psw)))
 
         // we must call encoding one time to calculate password key for key cache.
         // it must be after WriteCoderProperties!
@@ -1176,7 +1345,7 @@ HRESULT CEncoderInfo::Generate()
           CMyComPtr<ISequentialOutStream> crcStream = crcStreamSpec;
           crcStreamSpec->Init();
 
-          RINOK(_encoder->Code(inStream, crcStream, 0, 0, NULL));
+          RINOK(_encoder->Code(inStream, crcStream, NULL, NULL, NULL))
         }
       }
     }
@@ -1186,19 +1355,22 @@ HRESULT CEncoderInfo::Generate()
 }
 
 
-static void My_FilterBench(ICompressFilter *filter, Byte *data, size_t size)
+static void My_FilterBench(ICompressFilter *filter, Byte *data, size_t size, UInt32 *crc)
 {
   while (size != 0)
   {
-    UInt32 cur = (UInt32)1 << 31;
+    UInt32 cur = crc ? 1 << 17 : 1 << 24;
     if (cur > size)
       cur = (UInt32)size;
     UInt32 processed = filter->Filter(data, cur);
-    data += processed;
-    // if (processed > size) (in AES filter), we must fill last block with zeros.
-    // but it is not important for benchmark. So we just copy that data without filtering.
+    /* if (processed > size) (in AES filter), we must fill last block with zeros.
+       but it is not important for benchmark. So we just copy that data without filtering.
+       if (processed == 0) then filter can't process more  */
     if (processed > size || processed == 0)
-      break;
+      processed = (UInt32)size;
+    if (crc)
+      *crc = CrcUpdate(*crc, data, processed);
+    data += processed;
     size -= processed;
   }
 }
@@ -1206,9 +1378,13 @@ static void My_FilterBench(ICompressFilter *filter, Byte *data, size_t size)
 
 HRESULT CEncoderInfo::Encode()
 {
-  RINOK(Generate());
+  // printf("\nCEncoderInfo::Generate\n");
 
-  #ifndef _7ZIP_ST
+  RINOK(Generate())
+
+  // printf("\n2222\n");
+
+  #ifndef Z7_ST
   if (Common)
   {
     Results[0] = S_OK;
@@ -1243,7 +1419,7 @@ HRESULT CEncoderInfo::Encode()
 
   if (cp)
   {
-    RINOK(Set_Key_and_IV(cp));
+    RINOK(Set_Key_and_IV(cp))
   }
 
   compressedSize = 0;
@@ -1252,20 +1428,32 @@ HRESULT CEncoderInfo::Encode()
 
   // CBenchmarkOutStream *outStreamSpec = this->outStreamSpec;
   UInt64 prev = 0;
-  const UInt32 mask = (CheckCrc_Enc ? 0 : 0xFFF);
-  bool useCrc = (mask < NumIterations);
+  
+  const UInt32 mask = (CheckCrc_Enc ? 0 : 0xFFFF);
+  const bool useCrc = (mask < NumIterations);
   bool crcPrev_defined = false;
   UInt32 crcPrev = 0;
-  UInt64 i = NumIterations;
+  
+  bool useRealData_Enc = UseRealData_Enc;
+  bool data_Was_Changed = false;
+  if (useRealData_Enc)
+  {
+    /* we want memcpy() for each iteration including first iteration.
+       So results will be equal for different number of iterations */
+    data_Was_Changed = true;
+  }
+
+  const UInt64 numIterations = NumIterations;
+  UInt64 i = numIterations;
     // printCallback->NewLine();
 
   while (i != 0)
   {
     i--;
-    if (printCallback && bi.UnpackSize - prev >= (1 << 24))
+    if (printCallback && bi.UnpackSize - prev >= (1 << 26))
     {
-      RINOK(printCallback->CheckBreak());
       prev = bi.UnpackSize;
+      RINOK(printCallback->CheckBreak())
     }
 
     /*
@@ -1279,21 +1467,33 @@ HRESULT CEncoderInfo::Encode()
 
     if (_encoderFilter)
     {
-      // if (needRealData)
-      memcpy((Byte *)*outStreamSpec, uncompressedDataPtr, kBufferSize);
+      Byte *filterData = rgCopy;
+      if (i == numIterations - 1 || calcCrc || useRealData_Enc)
+      {
+        // printf("\nfilterData = (Byte *)*outStreamSpec;\n");
+        filterData = (Byte *)*outStreamSpec;
+        if (data_Was_Changed)
+        {
+          // printf("\nmemcpy(filterData, uncompressedDataPtr\n");
+          memcpy(filterData, uncompressedDataPtr, kBufferSize);
+        }
+        data_Was_Changed = true;
+      }
       _encoderFilter->Init();
-      My_FilterBench(_encoderFilter, (Byte *)*outStreamSpec, kBufferSize);
       if (calcCrc)
       {
+        // printf("\nInitCrc\n");
         outStreamSpec->InitCrc();
-        outStreamSpec->Calc((Byte *)*outStreamSpec, kBufferSize);
       }
+      // printf("\nMy_FilterBench\n");
+      My_FilterBench(_encoderFilter, filterData, kBufferSize,
+          calcCrc ? &outStreamSpec->Crc : NULL);
     }
     else
     {
       outStreamSpec->Init(true, calcCrc); // write real data for speed consistency at any number of iterations
       inStreamSpec->Init(uncompressedDataPtr, kBufferSize);
-      RINOK(_encoder->Code(inStream, outStream, NULL, NULL, progressInfo[0]));
+      RINOK(_encoder->Code(inStream, outStream, NULL, NULL, progressInfo[0]))
       if (!inStreamSpec->WasFinished())
         return E_FAIL;
       if (compressedSize != outStreamSpec->Pos)
@@ -1329,7 +1529,7 @@ HRESULT CEncoderInfo::Encode()
       info.PackSize = compressedSize;
       // printf("\n%7d\n", encoder.compressedSize);
       
-      RINOK(callback->SetEncodeResult(info, true));
+      RINOK(callback->SetEncodeResult(info, true))
       printCallback->NewLine();
     }
     */
@@ -1357,9 +1557,11 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
   else
     coder = decoder;
 
+  // printf("\ndecoderIndex = %d, stack = %p", decoderIndex, &coder);
+
   CMyComPtr<ICompressSetDecoderProperties2> setDecProps;
   coder.QueryInterface(IID_ICompressSetDecoderProperties2, &setDecProps);
-  if (!setDecProps && propStreamSpec->Pos != 0)
+  if (!setDecProps && propStreamSpec->GetPos() != 0)
     return E_FAIL;
 
   CCrcOutStream *crcOutStreamSpec = new CCrcOutStream;
@@ -1369,13 +1571,13 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
   pi->BenchInfo.UnpackSize = 0;
   pi->BenchInfo.PackSize = 0;
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   {
     CMyComPtr<ICompressSetCoderMt> setCoderMt;
     coder.QueryInterface(IID_ICompressSetCoderMt, &setCoderMt);
     if (setCoderMt)
     {
-      RINOK(setCoderMt->SetNumberOfThreads(NumDecoderSubThreads));
+      RINOK(setCoderMt->SetNumberOfThreads(NumDecoderSubThreads))
     }
   }
   #endif
@@ -1385,7 +1587,7 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
   if (scp)
   {
     const UInt64 reduceSize = _uncompressedDataSize;
-    RINOK(_method.SetCoderProps(scp, &reduceSize));
+    RINOK(_method.SetCoderProps(scp, &reduceSize))
   }
 
   CMyComPtr<ICryptoProperties> cp;
@@ -1393,7 +1595,10 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
   
   if (setDecProps)
   {
-    RINOK(setDecProps->SetDecoderProperties2((const Byte *)*propStreamSpec, (UInt32)propStreamSpec->Pos));
+    RINOK(setDecProps->SetDecoderProperties2(
+        /* (const Byte *)*propStreamSpec, */
+        propsData,
+        (UInt32)propStreamSpec->GetPos()))
   }
 
   {
@@ -1401,7 +1606,7 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
     coder.QueryInterface(IID_ICryptoSetPassword, &sp);
     if (sp)
     {
-      RINOK(sp->CryptoSetPassword(_psw, sizeof(_psw)));
+      RINOK(sp->CryptoSetPassword(_psw, sizeof(_psw)))
     }
   }
 
@@ -1409,7 +1614,7 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
   
   if (cp)
   {
-    RINOK(Set_Key_and_IV(cp));
+    RINOK(Set_Key_and_IV(cp))
   }
 
   CMyComPtr<ICompressSetFinishMode> setFinishMode;
@@ -1424,32 +1629,38 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
     decoder->QueryInterface(IID_ICompressSetFinishMode, (void **)&setFinishMode);
   }
 
-  const UInt64 numIterations = this->NumIterations;
-  const UInt32 mask = (CheckCrc_Dec ? 0 : 0xFFF);
+  const UInt64 numIterations = NumIterations;
+  const E_CheckCrcMode checkCrcMode = CheckCrcMode_Dec;
 
   for (UInt64 i = 0; i < numIterations; i++)
   {
-    if (printCallback && pi->BenchInfo.UnpackSize - prev >= (1 << 24))
+    if (printCallback && pi->BenchInfo.UnpackSize - prev >= (1 << 26))
     {
-      RINOK(printCallback->CheckBreak());
+      RINOK(printCallback->CheckBreak())
       prev = pi->BenchInfo.UnpackSize;
     }
 
     const UInt64 outSize = kBufferSize;
-    bool calcCrc = false;
-    if (((UInt32)i & mask) == 0)
-      calcCrc = true;
+    bool calcCrc = (checkCrcMode != k_CheckCrcMode_Never);
+
     crcOutStreamSpec->Init();
-    
+
     if (_decoderFilter)
     {
-      if (calcCrc) // for pure filter speed test without multi-iteration consistency
-      // if (needRealData)
-      memcpy((Byte *)rgCopy, (const Byte *)*outStreamSpec, compressedSize);
-      _decoderFilter->Init();
-      My_FilterBench(_decoderFilter, (Byte *)rgCopy, compressedSize);
+      Byte *filterData = (Byte *)*outStreamSpec;
       if (calcCrc)
-        crcOutStreamSpec->Calc((const Byte *)rgCopy, compressedSize);
+      {
+        calcCrc = (i == 0);
+        if (checkCrcMode == k_CheckCrcMode_Always)
+        {
+          calcCrc = true;
+          memcpy((Byte *)rgCopy, (const Byte *)*outStreamSpec, compressedSize);
+          filterData = rgCopy;
+        }
+      }
+      _decoderFilter->Init();
+      My_FilterBench(_decoderFilter, filterData, compressedSize,
+          calcCrc ? &crcOutStreamSpec->Crc : NULL);
     }
     else
     {
@@ -1458,10 +1669,10 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
 
       if (setFinishMode)
       {
-        RINOK(setFinishMode->SetFinishMode(BoolToUInt(true)));
+        RINOK(setFinishMode->SetFinishMode(BoolToUInt(true)))
       }
 
-      RINOK(decoder->Code(inStream, crcOutStream, 0, &outSize, progressInfo[decoderIndex]));
+      RINOK(decoder->Code(inStream, crcOutStream, NULL, &outSize, progressInfo[decoderIndex]))
 
       if (setFinishMode)
       {
@@ -1474,7 +1685,7 @@ HRESULT CEncoderInfo::Decode(UInt32 decoderIndex)
         if (getInStreamProcessedSize)
         {
           UInt64 processed;
-          RINOK(getInStreamProcessedSize->GetInStreamProcessedSize(&processed));
+          RINOK(getInStreamProcessedSize->GetInStreamProcessedSize(&processed))
           if (processed != compressedSize)
             return S_FALSE;
         }
@@ -1517,7 +1728,7 @@ static UInt64 GetNumIterations(UInt64 numCommands, UInt64 complexInCommands)
 
 
 
-#ifndef _7ZIP_ST
+#ifndef Z7_ST
 
 // ---------- CBenchThreadsFlusher ----------
 
@@ -1561,7 +1772,7 @@ WRes CBenchThreadsFlusher::StartAndWait(bool exitMode)
   return res;
 }
 
-#endif // _7ZIP_ST
+#endif // Z7_ST
 
 
 
@@ -1579,7 +1790,7 @@ static void SetPseudoRand(Byte *data, size_t size, UInt32 startValue)
 static HRESULT MethodBench(
     DECL_EXTERNAL_CODECS_LOC_VARS
     UInt64 complexInCommands,
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
       bool oldLzmaBenchMode,
       UInt32 numThreads,
       const CAffinityMode *affinityMode,
@@ -1596,10 +1807,11 @@ static HRESULT MethodBench(
   COneMethodInfo method = method2;
   UInt64 methodId;
   UInt32 numStreams;
+  bool isFilter;
   const int codecIndex = FindMethod_Index(
       EXTERNAL_CODECS_LOC_VARS
       method.MethodName, true,
-      methodId, numStreams);
+      methodId, numStreams, isFilter);
   if (codecIndex < 0)
     return E_NOTIMPL;
   if (numStreams != 1)
@@ -1608,7 +1820,7 @@ static HRESULT MethodBench(
   UInt32 numEncoderThreads = 1;
   UInt32 numSubDecoderThreads = 1;
   
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
     numEncoderThreads = numThreads;
 
     if (oldLzmaBenchMode)
@@ -1624,7 +1836,7 @@ static HRESULT MethodBench(
       }
     }
 
-  bool mtEncMode = (numEncoderThreads > 1) || affinityMode->NeedAffinity();
+  const bool mtEncMode = (numEncoderThreads > 1) || affinityMode->NeedAffinity();
 
   #endif
 
@@ -1636,10 +1848,10 @@ static HRESULT MethodBench(
   for (i = 0; i < numEncoderThreads; i++)
   {
     CEncoderInfo &encoder = encoders[i];
-    encoder.callback = (i == 0) ? callback : 0;
+    encoder.callback = (i == 0) ? callback : NULL;
     encoder.printCallback = printCallback;
 
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     encoder.EncoderIndex = i;
     encoder.NumEncoderInternalThreads = numSubDecoderThreads;
     encoder.AffinityMode = *affinityMode;
@@ -1659,14 +1871,11 @@ static HRESULT MethodBench(
 
     {
       CCreatedCoder cod;
-      RINOK(CreateCoder_Index(EXTERNAL_CODECS_LOC_VARS (unsigned)codecIndex, true, encoder._encoderFilter, cod));
+      RINOK(CreateCoder_Index(EXTERNAL_CODECS_LOC_VARS (unsigned)codecIndex, true, encoder._encoderFilter, cod))
       encoder._encoder = cod.Coder;
       if (!encoder._encoder && !encoder._encoderFilter)
         return E_NOTIMPL;
     }
-
-    encoder.CheckCrc_Enc = (benchProps->EncComplex) > 30;
-    encoder.CheckCrc_Dec = (benchProps->DecComplexCompr + benchProps->DecComplexUnc) > 30;
 
     SetPseudoRand(encoder._iv,  sizeof(encoder._iv), 17);
     SetPseudoRand(encoder._key, sizeof(encoder._key), 51);
@@ -1676,10 +1885,26 @@ static HRESULT MethodBench(
     {
       CCreatedCoder cod;
       CMyComPtr<ICompressCoder> &decoder = encoder._decoders[j];
-      RINOK(CreateCoder_Id(EXTERNAL_CODECS_LOC_VARS methodId, false, encoder._decoderFilter, cod));
+      RINOK(CreateCoder_Id(EXTERNAL_CODECS_LOC_VARS methodId, false, encoder._decoderFilter, cod))
       decoder = cod.Coder;
       if (!encoder._decoderFilter && !decoder)
         return E_NOTIMPL;
+    }
+
+    encoder.UseRealData_Enc =
+    encoder.CheckCrc_Enc = (benchProps->EncComplex) > 30;
+
+    encoder.CheckCrcMode_Dec = k_CheckCrcMode_Always;
+    if (benchProps->DecComplexCompr +
+        benchProps->DecComplexUnc <= 30)
+      encoder.CheckCrcMode_Dec =
+          k_CheckCrcMode_FirstPass; // for filters
+          // k_CheckCrcMode_Never; // for debug
+          // k_CheckCrcMode_Always; // for debug
+    if (fileData)
+    {
+      encoder.UseRealData_Enc = true;
+      encoder.CheckCrcMode_Dec = k_CheckCrcMode_Always;
     }
   }
 
@@ -1702,7 +1927,7 @@ static HRESULT MethodBench(
   status.Res = S_OK;
   status.EncodeMode = true;
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   CBenchThreadsFlusher encoderFlusher;
   if (mtEncMode)
   {
@@ -1718,12 +1943,26 @@ static HRESULT MethodBench(
   for (i = 0; i < numEncoderThreads; i++)
   {
     CEncoderInfo &encoder = encoders[i];
-    encoder.NumIterations = GetNumIterations(benchProps->GeComprCommands(uncompressedDataSize), complexInCommands);
+    encoder.NumIterations = GetNumIterations(benchProps->GetNumCommands_Enc(uncompressedDataSize), complexInCommands);
     // encoder.NumIterations = 3;
-    encoder.Salt = g_CrcTable[i & 0xFF];
-    encoder.Salt ^= (g_CrcTable[(i >> 8) & 0xFF] << 3);
+    {
+#if 0
+      #define kCrcPoly 0xEDB88320
+      UInt32 r = i;
+      unsigned num = numEncoderThreads < 256 ? 8 : 16;
+      do
+        r = (r >> 1) ^ (kCrcPoly & ((UInt32)0 - (r & 1)));
+      while (--num);
+      encoder.Salt = r;
+#else
+      UInt32 salt0 = g_CrcTable[(Byte)i];
+      UInt32 salt1 = g_CrcTable[(Byte)(i >> 8)];
+      encoder.Salt = salt0 ^ (salt1 << 3);
+#endif
+    }
+
     // (g_CrcTable[0] == 0), and (encoder.Salt == 0) for first thread
-    // printf(" %8x", encoder.Salt);
+    // printf("\n encoder index = %d, Salt = %8x\n", i, encoder.Salt);
 
     encoder.KeySize = benchProps->KeySize;
 
@@ -1742,14 +1981,15 @@ static HRESULT MethodBench(
       bpi->BenchInfo.NumIterations = numEncoderThreads;
     }
 
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     if (mtEncMode)
     {
       #ifdef USE_ALLOCA
-      encoder.AllocaSize = (i * 16 * 21) & 0x7FF;
+      encoder.AllocaSize = BENCH_ALLOCA_VALUE(i);
       #endif
 
       encoder.Common = &encoderFlusher.Common;
+      encoder.IsGlobalMtMode = numEncoderThreads > 1;
       RINOK(encoder.CreateEncoderThread())
     }
     #endif
@@ -1757,35 +1997,35 @@ static HRESULT MethodBench(
 
   if (printCallback)
   {
-    RINOK(printCallback->CheckBreak());
+    RINOK(printCallback->CheckBreak())
   }
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   if (mtEncMode)
   {
     for (i = 0; i < numEncoderThreads; i++)
     {
       CEncoderInfo &encoder = encoders[i];
-      WRes wres = encoder.ReadyEvent.Lock();
+      const WRes wres = encoder.ReadyEvent.Lock();
       if (wres != 0)
         return HRESULT_FROM_WIN32(wres);
-      RINOK(encoder.Results[0]);
+      RINOK(encoder.Results[0])
     }
 
     CBenchProgressInfo *bpi = encoders[0].progressInfoSpec[0];
     bpi->SetStartTime();
 
-    WRes wres = encoderFlusher.StartAndWait();
+    const WRes wres = encoderFlusher.StartAndWait();
     if (status.Res == 0 && wres != 0)
       return HRESULT_FROM_WIN32(wres);
   }
   else
   #endif
   {
-    RINOK(encoders[0].Encode());
+    RINOK(encoders[0].Encode())
   }
 
-  RINOK(status.Res);
+  RINOK(status.Res)
 
   CBenchInfo info;
 
@@ -1796,13 +2036,13 @@ static HRESULT MethodBench(
   
   for (i = 0; i < numEncoderThreads; i++)
   {
-    CEncoderInfo &encoder = encoders[i];
+    const CEncoderInfo &encoder = encoders[i];
     info.UnpackSize += encoder.kBufferSize;
     info.PackSize += encoder.compressedSize;
     // printf("\n%7d\n", encoder.compressedSize);
   }
   
-  RINOK(callback->SetEncodeResult(info, true));
+  RINOK(callback->SetEncodeResult(info, true))
 
 
 
@@ -1813,7 +2053,7 @@ static HRESULT MethodBench(
   status.EncodeMode = false;
 
   const UInt32 numDecoderThreads = numEncoderThreads * numSubDecoderThreads;
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   const bool mtDecoderMode = (numDecoderThreads > 1) || affinityMode->NeedAffinity();
   #endif
   
@@ -1822,7 +2062,7 @@ static HRESULT MethodBench(
     CEncoderInfo &encoder = encoders[i];
 
     /*
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     // encoder.affinityMode = *affinityMode;
     if (encoder.NumEncoderInternalThreads != 1)
       encoder.AffinityMode.DivideNum = encoder.NumEncoderInternalThreads;
@@ -1832,7 +2072,11 @@ static HRESULT MethodBench(
 
     if (i == 0)
     {
-      encoder.NumIterations = GetNumIterations(benchProps->GeDecomprCommands(encoder.compressedSize, encoder.kBufferSize), complexInCommands);
+      encoder.NumIterations = GetNumIterations(
+          benchProps->GetNumCommands_Dec(
+              encoder.compressedSize,
+              encoder.kBufferSize),
+          complexInCommands);
       CBenchProgressInfo *bpi = encoder.progressInfoSpec[0];
       bpi->Callback = callback;
       bpi->BenchInfo.NumIterations = numDecoderThreads;
@@ -1841,31 +2085,31 @@ static HRESULT MethodBench(
     else
       encoder.NumIterations = encoders[0].NumIterations;
 
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     {
-      int numSubThreads = method.Get_NumThreads();
+      const int numSubThreads = method.Get_NumThreads();
       encoder.NumDecoderSubThreads = (numSubThreads <= 0) ? 1 : (unsigned)numSubThreads;
     }
     if (mtDecoderMode)
     {
       for (UInt32 j = 0; j < numSubDecoderThreads; j++)
       {
-        HRESULT res = encoder.CreateDecoderThread(j, (i == 0 && j == 0)
+        const HRESULT res = encoder.CreateDecoderThread(j, (i == 0 && j == 0)
             #ifdef USE_ALLOCA
-            , ((i * numSubDecoderThreads + j) * 16 * 21) & 0x7FF
+            , BENCH_ALLOCA_VALUE(i * numSubDecoderThreads + j)
             #endif
             );
-        RINOK(res);
+        RINOK(res)
       }
     }
     else
     #endif
     {
-      RINOK(encoder.Decode(0));
+      RINOK(encoder.Decode(0))
     }
   }
   
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   if (mtDecoderMode)
   {
     WRes wres = 0;
@@ -1874,26 +2118,26 @@ static HRESULT MethodBench(
       for (UInt32 j = 0; j < numSubDecoderThreads; j++)
       {
         CEncoderInfo &encoder = encoders[i];
-        WRes wres2 = encoder.thread[j].
+        const WRes wres2 = encoder.thread[j].
             // Wait(); // later we can get thread times from thread in UNDER_CE
             Wait_Close();
         if (wres == 0 && wres2 != 0)
           wres = wres2;
-        HRESULT res2 = encoder.Results[j];
+        const HRESULT res2 = encoder.Results[j];
         if (res == 0 && res2 != 0)
           res = res2;
       }
     if (wres != 0)
       return HRESULT_FROM_WIN32(wres);
-    RINOK(res);
+    RINOK(res)
   }
-  #endif // _7ZIP_ST
+  #endif // Z7_ST
  
-  RINOK(status.Res);
+  RINOK(status.Res)
   encoders[0].progressInfoSpec[0]->SetFinishTime(info);
  
   /*
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   #ifdef UNDER_CE
   if (mtDecoderMode)
     for (i = 0; i < numEncoderThreads; i++)
@@ -1913,21 +2157,41 @@ static HRESULT MethodBench(
   
   for (i = 0; i < numEncoderThreads; i++)
   {
-    CEncoderInfo &encoder = encoders[i];
+    const CEncoderInfo &encoder = encoders[i];
     info.UnpackSize += encoder.kBufferSize;
     info.PackSize += encoder.compressedSize;
   }
   
-  RINOK(callback->SetDecodeResult(info, false));
-  RINOK(callback->SetDecodeResult(info, true));
+  // RINOK(callback->SetDecodeResult(info, false)) // why we called before 21.03 ??
+  RINOK(callback->SetDecodeResult(info, true))
   
   return S_OK;
 }
 
 
-static inline UInt64 GetLZMAUsage(bool multiThread, UInt32 dictionary)
+
+static inline UInt64 GetDictSizeFromLog(unsigned dictSizeLog)
 {
-  UInt32 hs = dictionary - 1;
+  /*
+  if (dictSizeLog < 32)
+    return (UInt32)1 << dictSizeLog;
+  else
+    return (UInt32)(Int32)-1;
+  */
+  return (UInt64)1 << dictSizeLog;
+}
+
+
+// it's limit of current LZMA implementation that can be changed later
+#define kLzmaMaxDictSize ((UInt32)15 << 28)
+
+static inline UInt64 GetLZMAUsage(bool multiThread, int btMode, UInt64 dict)
+{
+  if (dict == 0)
+    dict = 1;
+  if (dict > kLzmaMaxDictSize)
+    dict = kLzmaMaxDictSize;
+  UInt32 hs = (UInt32)dict - 1;
   hs |= (hs >> 1);
   hs |= (hs >> 2);
   hs |= (hs >> 4);
@@ -1937,29 +2201,59 @@ static inline UInt64 GetLZMAUsage(bool multiThread, UInt32 dictionary)
   if (hs > (1 << 24))
     hs >>= 1;
   hs++;
-  return ((hs + (1 << 16)) + (UInt64)dictionary * 2) * 4 + (UInt64)dictionary * 3 / 2 +
+  hs += (1 << 16);
+
+  const UInt32 kBlockSizeMax = (UInt32)0 - (UInt32)(1 << 16);
+  UInt64 blockSize = (UInt64)dict + (1 << 16)
+      + (multiThread ? (1 << 20) : 0);
+  blockSize += (blockSize >> (blockSize < ((UInt32)1 << 30) ? 1 : 2));
+  if (blockSize >= kBlockSizeMax)
+    blockSize = kBlockSizeMax;
+
+  UInt64 son = (UInt64)dict;
+  if (btMode)
+    son *= 2;
+  const UInt64 v = (hs + son) * 4 + blockSize +
       (1 << 20) + (multiThread ? (6 << 20) : 0);
+
+  // printf("\nGetLZMAUsage = %d\n", (UInt32)(v >> 20));
+  // printf("\nblockSize = %d\n", (UInt32)(blockSize >> 20));
+  return v;
 }
 
-UInt64 GetBenchMemoryUsage(UInt32 numThreads, UInt32 dictionary, bool totalBench)
+
+UInt64 GetBenchMemoryUsage(UInt32 numThreads, int level, UInt64 dictionary, bool totalBench)
 {
-  const UInt32 kBufferSize = dictionary;
-  const UInt32 kCompressedBufferSize = kBufferSize; // / 2;
-  bool lzmaMt = (totalBench || numThreads > 1);
+  const size_t kBufferSize = (size_t)dictionary + kAdditionalSize;
+  const UInt64 kCompressedBufferSize = GetBenchCompressedSize(kBufferSize); // / 2;
+  if (level < 0)
+    level = 5;
+  const int algo = (level < 5 ? 0 : 1);
+  const int btMode = (algo == 0 ? 0 : 1);
+
   UInt32 numBigThreads = numThreads;
-  if (!totalBench && lzmaMt)
-    numBigThreads /= 2;
+  const bool lzmaMt = (totalBench || (numThreads > 1 && btMode));
+  if (btMode)
+  {
+    if (!totalBench && lzmaMt)
+      numBigThreads /= 2;
+  }
   return ((UInt64)kBufferSize + kCompressedBufferSize +
-    GetLZMAUsage(lzmaMt, dictionary) + (2 << 20)) * numBigThreads;
+    GetLZMAUsage(lzmaMt, btMode, dictionary) + (2 << 20)) * numBigThreads;
 }
 
+static UInt64 GetBenchMemoryUsage_Hash(UInt32 numThreads, UInt64 dictionary)
+{
+  // dictionary += (dictionary >> 9); // for page tables (virtual memory)
+  return (UInt64)(dictionary + (1 << 15)) * numThreads + (2 << 20);
+}
 
 
 // ---------- CRC and HASH ----------
 
 struct CCrcInfo_Base
 {
-  CAlignedBuffer Buffer;
+  CMidAlignedBuffer Buffer;
   const Byte *Data;
   size_t Size;
   bool CreateLocalBuf;
@@ -1974,19 +2268,32 @@ struct CCrcInfo_Base
 };
 
 
+// for debug: define it to test hash calling with unaligned data
+// #define Z7_BENCH_HASH_ALIGN_BUF_OFFSET  3
+
 HRESULT CCrcInfo_Base::Generate(const Byte *data, size_t size)
 {
   Size = size;
   Data = data;
   if (!data || CreateLocalBuf)
   {
-    ALLOC_WITH_HRESULT(&Buffer, size)
-    Data = Buffer;
+    Byte *buf;
+    const size_t size2 = (size + k_RandBuf_AlignMask) & ~(size_t)k_RandBuf_AlignMask;
+    if (size2 < size)
+      return E_OUTOFMEMORY;
+#ifdef Z7_BENCH_HASH_ALIGN_BUF_OFFSET
+    ALLOC_WITH_HRESULT(&Buffer, size2 + Z7_BENCH_HASH_ALIGN_BUF_OFFSET)
+    buf = Buffer + Z7_BENCH_HASH_ALIGN_BUF_OFFSET;
+#else
+    ALLOC_WITH_HRESULT(&Buffer, size2)
+    buf = Buffer;
+#endif
+    Data = buf;
+    if (!data)
+      RandGen_BufAfterPad(buf, size);
+    else if (size != 0) // (CreateLocalBuf == true)
+      memcpy(buf, data, size);
   }
-  if (!data)
-    RandGen(Buffer, size);
-  else if (CreateLocalBuf && size != 0)
-    memcpy(Buffer, data, size);
   return S_OK;
 }
 
@@ -1996,13 +2303,13 @@ HRESULT CCrcInfo_Base::CrcProcess(UInt64 numIterations,
     IBenchPrintCallback *callback)
 {
   MY_ALIGN(16)
-  Byte hash[64];
-  memset(hash, 0, sizeof(hash));
+  UInt32 hash32[64 / 4];
+  memset(hash32, 0, sizeof(hash32));
 
   CheckSum_Res = 0;
 
   const UInt32 hashSize = hf->GetDigestSize();
-  if (hashSize > sizeof(hash))
+  if (hashSize > sizeof(hash32))
     return S_FALSE;
 
   const Byte *buf = Data;
@@ -2012,7 +2319,7 @@ HRESULT CCrcInfo_Base::CrcProcess(UInt64 numIterations,
   UInt64 prev = 0;
   UInt64 cur = 0;
 
-  for (UInt64 i = 0; i < numIterations; i++)
+  do
   {
     hf->Init();
     size_t pos = 0;
@@ -2026,12 +2333,12 @@ HRESULT CCrcInfo_Base::CrcProcess(UInt64 numIterations,
     }
     while (pos != size);
 
-    hf->Final(hash);
+    hf->Final((Byte *)(void *)hash32);
     UInt32 sum = 0;
     for (UInt32 j = 0; j < hashSize; j += 4)
     {
       sum = rotlFixed(sum, 11);
-      sum += GetUi32(hash + j);
+      sum += GetUi32((const Byte *)(const void *)hash32 + j);
     }
     if (checkSum)
     {
@@ -2049,10 +2356,12 @@ HRESULT CCrcInfo_Base::CrcProcess(UInt64 numIterations,
       if (cur - prev >= ((UInt32)1 << 30))
       {
         prev = cur;
-        RINOK(callback->CheckBreak());
+        RINOK(callback->CheckBreak())
       }
     }
   }
+  while (--numIterations);
+
   CheckSum_Res = checkSum_Prev;
   return S_OK;
 }
@@ -2081,7 +2390,7 @@ static UInt32 CountCpuFreq(UInt32 sum, UInt32 num, UInt32 val)
 EXTERN_C_END
 
 
-#ifndef _7ZIP_ST
+#ifndef Z7_ST
 
 struct CBaseThreadInfo
 {
@@ -2111,13 +2420,16 @@ static THREAD_FUNC_DECL FreqThreadFunction(void *param)
   UInt32 sum = g_BenchCpuFreqTemp;
   for (UInt64 k = p->NumIterations; k > 0; k--)
   {
-    p->CallbackRes = p->Callback->CheckBreak();
-    if (p->CallbackRes != S_OK)
-      return 0;
+    if (p->Callback)
+    {
+      p->CallbackRes = p->Callback->CheckBreak();
+      if (p->CallbackRes != S_OK)
+        break;
+    }
     sum = CountCpuFreq(sum, p->Size, g_BenchCpuFreqTemp);
   }
   p->ValRes = sum;
-  return 0;
+  return THREAD_FUNC_RET_ZERO;
 }
 
 struct CFreqThreads
@@ -2161,7 +2473,7 @@ struct CCrcInfo: public CBaseThreadInfo
   HRESULT Res;
   UInt32 CheckSum_Res;
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   NSynchronization::CManualResetEvent ReadyEvent;
   UInt32 ThreadIndex;
   CBenchSyncCommon *Common;
@@ -2245,7 +2557,7 @@ static THREAD_FUNC_DECL CrcThreadFunction(void *param)
   alloca(p->AllocaSize);
   #endif
   p->Process();
-  return 0;
+  return THREAD_FUNC_RET_ZERO;
 }
 
 
@@ -2290,13 +2602,15 @@ WRes CCrcThreads::StartAndWait(bool exitMode)
 #endif
 
 
+/*
 static UInt32 CrcCalc1(const Byte *buf, size_t size)
 {
-  UInt32 crc = CRC_INIT_VAL;;
+  UInt32 crc = CRC_INIT_VAL;
   for (size_t i = 0; i < size; i++)
     crc = CRC_UPDATE_BYTE(crc, buf[i]);
   return CRC_GET_DIGEST(crc);
 }
+*/
 
 /*
 static UInt32 RandGenCrc(Byte *buf, size_t size, CBaseRandomGenerator &RG)
@@ -2309,34 +2623,30 @@ static UInt32 RandGenCrc(Byte *buf, size_t size, CBaseRandomGenerator &RG)
 static bool CrcInternalTest()
 {
   CAlignedBuffer buffer;
-  const size_t kBufferSize0 = (1 << 8);
-  const size_t kBufferSize1 = (1 << 10);
-  const unsigned kCheckSize = (1 << 5);
-  buffer.Alloc(kBufferSize0 + kBufferSize1);
+  const size_t kBufSize = 1 << 11;
+  const size_t kCheckSize = 1 << 6;
+  buffer.Alloc(kBufSize);
   if (!buffer.IsAllocated())
     return false;
   Byte *buf = (Byte *)buffer;
-  size_t i;
-  for (i = 0; i < kBufferSize0; i++)
-    buf[i] = (Byte)i;
-  UInt32 crc1 = CrcCalc1(buf, kBufferSize0);
-  if (crc1 != 0x29058C73)
-    return false;
-  RandGen(buf + kBufferSize0, kBufferSize1);
-  for (i = 0; i < kBufferSize0 + kBufferSize1 - kCheckSize; i++)
-    for (unsigned j = 0; j < kCheckSize; j++)
-      if (CrcCalc1(buf + i, j) != CrcCalc(buf + i, j))
-        return false;
-  return true;
+  RandGen_BufAfterPad(buf, kBufSize);
+  UInt32 sum = 0;
+  for (size_t i = 0; i < kBufSize - kCheckSize * 2; i += kCheckSize - 1)
+    for (size_t j = 0; j < kCheckSize; j++)
+    {
+      sum = rotlFixed(sum, 11);
+      sum += CrcCalc(buf + i + j, j);
+    }
+  return sum == 0x28462c7c;
 }
 
 struct CBenchMethod
 {
   unsigned Weight;
   unsigned DictBits;
-  UInt32 EncComplex;
-  UInt32 DecComplexCompr;
-  UInt32 DecComplexUnc;
+  Int32 EncComplex;
+  Int32 DecComplexCompr;
+  Int32 DecComplexUnc;
   const char *Name;
   // unsigned KeySize;
 };
@@ -2375,6 +2685,9 @@ static const CBenchMethod g_Bench[] =
   // { 10, 22, 1655,    0, 1830, "PPMDZip:x5" },
   { 10, 22, 1655,    0, 1830, "PPMD:x5" },
 
+  // {  2,  0,  -16,    0,  -16, "Swap2" },
+  {  2,  0,  -16,    0,  -16, "Swap4" },
+
   // {  2,  0,    3,    0,    4, "Delta:1" },
   // {  2,  0,    3,    0,    4, "Delta:2" },
   // {  2,  0,    3,    0,    4, "Delta:3" },
@@ -2382,8 +2695,10 @@ static const CBenchMethod g_Bench[] =
   // {  2,  0,    3,    0,    4, "Delta:8" },
   // {  2,  0,    3,    0,    4, "Delta:32" },
 
-  {  2,  0,    4,    0,    4, "BCJ" },
-
+  {  2,  0,    2,    0,    2, "BCJ" },
+  {  2,  0,    1,    0,    1, "ARM64" },
+  {  2,  0,    1,    0,    1, "RISCV" },
+  
   // { 10,  0,   18,    0,   18, "AES128CBC:1" },
   // { 10,  0,   21,    0,   21, "AES192CBC:1" },
   { 10,  0,   24,    0,   24, "AES256CBC:1" },
@@ -2399,13 +2714,13 @@ static const CBenchMethod g_Bench[] =
   // {  2,  0, CMPLX(1), 0, CMPLX(1), "AES192CTR:2" },
   // {  2,  0, CMPLX(1), 0, CMPLX(1), "AES256CTR:2" },
 
-  // {  1,  0, CMPLX(6), 0, CMPLX(1), "AES128CBC:3" },
-  // {  1,  0, CMPLX(7), 0, CMPLX(1), "AES192CBC:3" },
-  {  1,  0, CMPLX(8), 0, CMPLX(1), "AES256CBC:3" }
+  // {  1,  0, CMPLX(6), 0, -2, "AES128CBC:3" },
+  // {  1,  0, CMPLX(7), 0, -2, "AES192CBC:3" },
+  {  1,  0, CMPLX(8), 0, -2, "AES256CBC:3" }
   
-  // {  1,  0, CMPLX(1), 0, CMPLX(1), "AES128CTR:3" },
-  // {  1,  0, CMPLX(1), 0, CMPLX(1), "AES192CTR:3" },
-  // {  1,  0, CMPLX(1), 0, CMPLX(1), "AES256CTR:3" },
+  // {  1,  0, CMPLX(1), 0, -2, "AES128CTR:3" },
+  // {  1,  0, CMPLX(1), 0, -2, "AES192CTR:3" },
+  // {  1,  0, CMPLX(1), 0, -2, "AES256CTR:3" },
 };
 
 struct CBenchHash
@@ -2419,14 +2734,15 @@ struct CBenchHash
 // #define ARM_CRC_MUL 100
 #define ARM_CRC_MUL 1
 
+#define k_Hash_Complex_Mult 256
+
 static const CBenchHash g_Hash[] =
 {
-  {  1,  1820, 0x21e207bb, "CRC32:1" },
-  { 10,   558, 0x21e207bb, "CRC32:4" },
-  { 10,   339, 0x21e207bb, "CRC32:8" } ,
+  { 20,   256, 0x21e207bb, "CRC32:12" } ,
   {  2,   128 *ARM_CRC_MUL, 0x21e207bb, "CRC32:32" },
   {  2,    64 *ARM_CRC_MUL, 0x21e207bb, "CRC32:64" },
-  { 10,   512, 0x41b901d1, "CRC64" },
+  { 10,   256, 0x41b901d1, "CRC64" },
+  { 10,    64, 0x43eac94f, "XXH64" },
   
   { 10, 5100,       0x7913ba03, "SHA256:1" },
   {  2, CMPLX((32 * 4 + 1) * 4 + 4), 0x7913ba03, "SHA256:2" },
@@ -2434,28 +2750,15 @@ static const CBenchHash g_Hash[] =
   { 10, 2340,       0xff769021, "SHA1:1" },
   {  2, CMPLX((20 * 6 + 1) * 4 + 4), 0xff769021, "SHA1:2" },
   
-  {  2,  5500, 0x85189d02, "BLAKE2sp" }
-};
-
-struct CTotalBenchRes
-{
-  // UInt64 NumIterations1; // for Usage
-  UInt64 NumIterations2; // for Rating / RPU
-
-  UInt64 Rating;
-  UInt64 Usage;
-  UInt64 RPU;
-  
-  void Init() { /* NumIterations1 = 0; */ NumIterations2 = 0; Rating = 0; Usage = 0; RPU = 0; }
-
-  void SetSum(const CTotalBenchRes &r1, const CTotalBenchRes &r2)
-  {
-    Rating = (r1.Rating + r2.Rating);
-    Usage = (r1.Usage + r2.Usage);
-    RPU = (r1.RPU + r2.RPU);
-    // NumIterations1 = (r1.NumIterations1 + r2.NumIterations1);
-    NumIterations2 = (r1.NumIterations2 + r2.NumIterations2);
-  }
+  {  2,  4096, 0x85189d02, "BLAKE2sp:1" },
+  {  2,  1024, 0x85189d02, "BLAKE2sp:2" }, // sse2-way4-fast
+  {  2,   512, 0x85189d02, "BLAKE2sp:3" }  // avx2-way8-fast
+#if 0
+  , {  2,  2048, 0x85189d02, "BLAKE2sp:4" } // sse2-way1
+  , {  2,  1024, 0x85189d02, "BLAKE2sp:5" } // sse2-way2
+  , {  2,  1024, 0x85189d02, "BLAKE2sp:6" } // avx2-way2
+  , {  2,  1024, 0x85189d02, "BLAKE2sp:7" } // avx2-way4
+#endif
 };
 
 static void PrintNumber(IBenchPrintCallback &f, UInt64 value, unsigned size)
@@ -2489,6 +2792,8 @@ static const unsigned kFieldSize_RU = 6;
 static const unsigned kFieldSize_Rating = 6;
 static const unsigned kFieldSize_EU = 5;
 static const unsigned kFieldSize_Effec = 5;
+static const unsigned kFieldSize_CrcSpeed = 8;
+
 
 static const unsigned kFieldSize_TotalSize = 4 + kFieldSize_Speed + kFieldSize_Usage + kFieldSize_RU + kFieldSize_Rating;
 static const unsigned kFieldSize_EUAndEffec = 2 + kFieldSize_EU + kFieldSize_Effec;
@@ -2523,7 +2828,7 @@ static void PrintSpaces(IBenchPrintCallback &f, unsigned size)
 
 static void PrintUsage(IBenchPrintCallback &f, UInt64 usage, unsigned size)
 {
-  PrintNumber(f, (usage + 5000) / 10000, size);
+  PrintNumber(f, Benchmark_GetUsage_Percents(usage), size);
 }
 
 static void PrintResults(IBenchPrintCallback &f, UInt64 usage, UInt64 rpu, UInt64 rating, bool showFreq, UInt64 cpuFreq)
@@ -2537,15 +2842,37 @@ static void PrintResults(IBenchPrintCallback &f, UInt64 usage, UInt64 rpu, UInt6
       PrintSpaces(f, kFieldSize_EUAndEffec);
     else
     {
-      UInt64 ddd = cpuFreq * usage / 100;
-      /*
-      if (ddd == 0)
-        ddd = 1;
-      */
-      PrintPercents(f, (rating * 10000), ddd, kFieldSize_EU);
+      PrintPercents(f, rating, cpuFreq * usage / kBenchmarkUsageMult, kFieldSize_EU);
       PrintPercents(f, rating, cpuFreq, kFieldSize_Effec);
     }
   }
+}
+
+
+void CTotalBenchRes::Generate_From_BenchInfo(const CBenchInfo &info)
+{
+  Speed = info.GetUnpackSizeSpeed();
+  Usage = info.GetUsage();
+  RPU = info.GetRatingPerUsage(Rating);
+}
+
+void CTotalBenchRes::Mult_For_Weight(unsigned weight)
+{
+  NumIterations2 *= weight;
+  RPU *= weight;
+  Rating *= weight;
+  Usage *= weight;
+  Speed *= weight;
+}
+
+void CTotalBenchRes::Update_With_Res(const CTotalBenchRes &r)
+{
+  Rating += r.Rating;
+  Usage += r.Usage;
+  RPU += r.RPU;
+  Speed += r.Speed;
+    // NumIterations1 = (r1.NumIterations1 + r2.NumIterations1);
+  NumIterations2 += r.NumIterations2;
 }
 
 static void PrintResults(IBenchPrintCallback *f,
@@ -2555,36 +2882,43 @@ static void PrintResults(IBenchPrintCallback *f,
     bool showFreq, UInt64 cpuFreq,
     CTotalBenchRes *res)
 {
-  UInt64 speed = info.GetSpeed(info.UnpackSize * info.NumIterations);
+  CTotalBenchRes t;
+  t.Rating = rating;
+  t.NumIterations2 = 1;
+  t.Generate_From_BenchInfo(info);
+  
   if (f)
   {
-    if (speed != 0)
-      PrintNumber(*f, speed / 1024, kFieldSize_Speed);
+    if (t.Speed != 0)
+      PrintNumber(*f, t.Speed / 1024, kFieldSize_Speed);
     else
       PrintSpaces(*f, 1 + kFieldSize_Speed);
   }
-  UInt64 usage = info.GetUsage();
-  UInt64 rpu = info.GetRatingPerUsage(rating);
   if (f)
   {
-    PrintResults(*f, usage, rpu, rating, showFreq, cpuFreq);
+    PrintResults(*f, t.Usage, t.RPU, rating, showFreq, cpuFreq);
   }
 
   if (res)
   {
     // res->NumIterations1++;
-    res->NumIterations2 += weight;
-    res->RPU += (rpu * weight);
-    res->Rating += (rating * weight);
-    res->Usage += (usage * weight);
+    t.Mult_For_Weight(weight);
+    res->Update_With_Res(t);
   }
 }
 
-static void PrintTotals(IBenchPrintCallback &f, bool showFreq, UInt64 cpuFreq, const CTotalBenchRes &res)
+static void PrintTotals(IBenchPrintCallback &f,
+    bool showFreq, UInt64 cpuFreq, bool showSpeed, const CTotalBenchRes &res)
 {
-  PrintSpaces(f, 1 + kFieldSize_Speed);
+  const UInt64 numIterations2 = res.NumIterations2 ? res.NumIterations2 : 1;
+  const UInt64 speed = res.Speed / numIterations2;
+  if (showSpeed && speed != 0)
+    PrintNumber(f, speed / 1024, kFieldSize_Speed);
+  else
+    PrintSpaces(f, 1 + kFieldSize_Speed);
+
+  // PrintSpaces(f, 1 + kFieldSize_Speed);
   // UInt64 numIterations1 = res.NumIterations1; if (numIterations1 == 0) numIterations1 = 1;
-  UInt64 numIterations2 = res.NumIterations2; if (numIterations2 == 0) numIterations2 = 1;
   PrintResults(f, res.Usage / numIterations2, res.RPU / numIterations2, res.Rating / numIterations2, showFreq, cpuFreq);
 }
 
@@ -2634,7 +2968,7 @@ AString GetProcessThreadsInfo(const NSystem::CProcessAffinity &ti)
 }
 
 
-#ifdef _7ZIP_LARGE_PAGES
+#ifdef Z7_LARGE_PAGES
 
 #ifdef _WIN32
 extern bool g_LargePagesMode;
@@ -2649,7 +2983,7 @@ void Add_LargePages_String(AString &s)
   #ifdef _WIN32
   if (g_LargePagesMode || g_LargePageSize != 0)
   {
-    s += " (LP-";
+    s.Add_OptSpaced("(LP-");
     PrintSize_KMGT_Or_Hex(s, g_LargePageSize);
     #ifdef MY_CPU_X86_OR_AMD64
     if (CPU_IsSupported_PageGB())
@@ -2679,7 +3013,7 @@ static void PrintRequirements(IBenchPrintCallback &f, const char *sizeString,
     f.Print("      ?");
   f.Print(" MB");
   
-  #ifdef _7ZIP_LARGE_PAGES
+  #ifdef Z7_LARGE_PAGES
   {
     AString s;
     Add_LargePages_String(s);
@@ -2694,30 +3028,34 @@ static void PrintRequirements(IBenchPrintCallback &f, const char *sizeString,
 
 
 
-struct CBenchCallbackToPrint: public IBenchCallback
+struct CBenchCallbackToPrint Z7_final: public IBenchCallback
 {
-  CBenchProps BenchProps;
-  CTotalBenchRes EncodeRes;
-  CTotalBenchRes DecodeRes;
-  IBenchPrintCallback *_file;
-  UInt32 DictSize;
-
+  bool NeedPrint;
   bool Use2Columns;
-  unsigned NameFieldSize;
-
   bool ShowFreq;
-  UInt64 CpuFreq;
+  unsigned NameFieldSize;
 
   unsigned EncodeWeight;
   unsigned DecodeWeight;
 
+  UInt64 CpuFreq;
+  UInt64 DictSize;
+
+  IBenchPrintCallback *_file;
+  CBenchProps BenchProps;
+  CTotalBenchRes EncodeRes;
+  CTotalBenchRes DecodeRes;
+
+  CBenchInfo BenchInfo_Results[2];
+  
   CBenchCallbackToPrint():
+      NeedPrint(true),
       Use2Columns(false),
-      NameFieldSize(0),
       ShowFreq(false),
-      CpuFreq(0),
+      NameFieldSize(0),
       EncodeWeight(1),
-      DecodeWeight(1)
+      DecodeWeight(1),
+      CpuFreq(0)
       {}
 
   void Init() { EncodeRes.Init(); DecodeRes.Init(); }
@@ -2725,8 +3063,8 @@ struct CBenchCallbackToPrint: public IBenchCallback
   void NewLine();
   
   HRESULT SetFreq(bool showFreq, UInt64 cpuFreq);
-  HRESULT SetEncodeResult(const CBenchInfo &info, bool final);
-  HRESULT SetDecodeResult(const CBenchInfo &info, bool final);
+  HRESULT SetEncodeResult(const CBenchInfo &info, bool final) Z7_override;
+  HRESULT SetDecodeResult(const CBenchInfo &info, bool final) Z7_override;
 };
 
 HRESULT CBenchCallbackToPrint::SetFreq(bool showFreq, UInt64 cpuFreq)
@@ -2738,10 +3076,13 @@ HRESULT CBenchCallbackToPrint::SetFreq(bool showFreq, UInt64 cpuFreq)
 
 HRESULT CBenchCallbackToPrint::SetEncodeResult(const CBenchInfo &info, bool final)
 {
-  RINOK(_file->CheckBreak());
+  RINOK(_file->CheckBreak())
   if (final)
+    BenchInfo_Results[0] = info;
+  if (final)
+  if (NeedPrint)
   {
-    UInt64 rating = BenchProps.GetCompressRating(DictSize, info.GlobalTime, info.GlobalFreq, info.UnpackSize * info.NumIterations);
+    const UInt64 rating = BenchProps.GetRating_Enc(DictSize, info.GlobalTime, info.GlobalFreq, info.UnpackSize * info.NumIterations);
     PrintResults(_file, info,
         EncodeWeight, rating,
         ShowFreq, CpuFreq, &EncodeRes);
@@ -2755,10 +3096,13 @@ static const char * const kSep = "  | ";
 
 HRESULT CBenchCallbackToPrint::SetDecodeResult(const CBenchInfo &info, bool final)
 {
-  RINOK(_file->CheckBreak());
+  RINOK(_file->CheckBreak())
   if (final)
+    BenchInfo_Results[1] = info;
+  if (final)
+  if (NeedPrint)
   {
-    UInt64 rating = BenchProps.GetDecompressRating(info.GlobalTime, info.GlobalFreq, info.UnpackSize, info.PackSize, info.NumIterations);
+    const UInt64 rating = BenchProps.GetRating_Dec(info.GlobalTime, info.GlobalFreq, info.UnpackSize, info.PackSize, info.NumIterations);
     if (Use2Columns)
       _file->Print(kSep);
     else
@@ -2800,10 +3144,22 @@ static void PrintRight(IBenchPrintCallback &f, const char *s, unsigned size)
   f.Print(s);
 }
 
+
+static bool DoesWildcardMatchName_NoCase(const AString &mask, const char *name)
+{
+  UString wildc = GetUnicodeString(mask);
+  UString bname = GetUnicodeString(name);
+  wildc.MakeLower_Ascii();
+  bname.MakeLower_Ascii();
+  return DoesWildcardMatchName(wildc, bname);
+}
+
+
 static HRESULT TotalBench(
     DECL_EXTERNAL_CODECS_LOC_VARS
+    const COneMethodInfo &methodMask,
     UInt64 complexInCommands,
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
     UInt32 numThreads,
     const CAffinityMode *affinityMode,
   #endif
@@ -2812,9 +3168,11 @@ static HRESULT TotalBench(
     const Byte *fileData,
     IBenchPrintCallback *printCallback, CBenchCallbackToPrint *callback)
 {
-  for (unsigned i = 0; i < ARRAY_SIZE(g_Bench); i++)
+  for (unsigned i = 0; i < Z7_ARRAY_SIZE(g_Bench); i++)
   {
     const CBenchMethod &bench = g_Bench[i];
+    if (!DoesWildcardMatchName_NoCase(methodMask.MethodName, bench.Name))
+      continue;
     PrintLeft(*callback->_file, bench.Name, kFieldSize_Name);
     {
       unsigned keySize = 32;
@@ -2829,7 +3187,7 @@ static HRESULT TotalBench(
     COneMethodInfo method;
     NCOM::CPropVariant propVariant;
     propVariant = bench.Name;
-    RINOK(method.ParseMethodFromPROPVARIANT(UString(), propVariant));
+    RINOK(method.ParseMethodFromPROPVARIANT(UString(), propVariant))
 
     size_t unpackSize2 = unpackSize;
     if (!forceUnpackSize && bench.DictBits == 0)
@@ -2838,10 +3196,10 @@ static HRESULT TotalBench(
     callback->EncodeWeight = bench.Weight;
     callback->DecodeWeight = bench.Weight;
 
-    HRESULT res = MethodBench(
+    const HRESULT res = MethodBench(
         EXTERNAL_CODECS_LOC_VARS
         complexInCommands,
-        #ifndef _7ZIP_ST
+        #ifndef Z7_ST
         false, numThreads, affinityMode,
         #endif
         method,
@@ -2858,7 +3216,7 @@ static HRESULT TotalBench(
     }
     else
     {
-      RINOK(res);
+      RINOK(res)
     }
     
     callback->NewLine();
@@ -2876,14 +3234,15 @@ struct CFreqBench
   UInt64 specifiedFreq;
   
   // out:
-  UInt64 cpuFreq;
+  UInt64 CpuFreqRes;
+  UInt64 UsageRes;
   UInt32 res;
 
   CFreqBench()
     {}
     
   HRESULT FreqBench(IBenchPrintCallback *_file
-      #ifndef _7ZIP_ST
+      #ifndef Z7_ST
       , const CAffinityMode *affinityMode
       #endif
       );
@@ -2891,18 +3250,19 @@ struct CFreqBench
 
 
 HRESULT CFreqBench::FreqBench(IBenchPrintCallback *_file
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     , const CAffinityMode *affinityMode
     #endif
     )
 {
   res = 0;
-  cpuFreq = 0;
+  CpuFreqRes = 0;
+  UsageRes = 0;
 
   if (numThreads == 0)
     numThreads = 1;
 
-  #ifdef _7ZIP_ST
+  #ifdef Z7_ST
   numThreads = 1;
   #endif
 
@@ -2919,7 +3279,7 @@ HRESULT CFreqBench::FreqBench(IBenchPrintCallback *_file
 
   CBenchInfoCalc progressInfoSpec;
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
 
   bool mtMode = (numThreads > 1) || affinityMode->NeedAffinity();
 
@@ -2952,7 +3312,7 @@ HRESULT CFreqBench::FreqBench(IBenchPrintCallback *_file
       return HRESULT_FROM_WIN32(wres);
     for (i = 0; i < numThreads; i++)
     {
-      RINOK(threads.Items[i].CallbackRes);
+      RINOK(threads.Items[i].CallbackRes)
     }
   }
   else
@@ -2960,21 +3320,23 @@ HRESULT CFreqBench::FreqBench(IBenchPrintCallback *_file
   {
     progressInfoSpec.SetStartTime();
     UInt32 sum = g_BenchCpuFreqTemp;
-    for (UInt64 k = numIterations; k > 0; k--)
+    UInt64 k = numIterations;
+    do
     {
       sum = CountCpuFreq(sum, numIterations2, g_BenchCpuFreqTemp);
       if (_file)
       {
-        RINOK(_file->CheckBreak());
+        RINOK(_file->CheckBreak())
       }
     }
+    while (--k);
     res += sum;
   }
 
   if (res == 0x12345678)
   if (_file)
   {
-    RINOK(_file->CheckBreak());
+    RINOK(_file->CheckBreak())
   }
   
   CBenchInfo info;
@@ -2984,18 +3346,18 @@ HRESULT CFreqBench::FreqBench(IBenchPrintCallback *_file
   info.PackSize = 0;
   info.NumIterations = 1;
 
+  const UInt64 numCommands = (UInt64)numIterations * numIterations2 * numThreads * complexity;
+  const UInt64 rating = info.GetSpeed(numCommands);
+  CpuFreqRes = rating / numThreads;
+  UsageRes = info.GetUsage();
+
   if (_file)
   {
-    {
-      UInt64 numCommands = (UInt64)numIterations * numIterations2 * numThreads * complexity;
-      UInt64 rating = info.GetSpeed(numCommands);
-      cpuFreq = rating / numThreads;
-      PrintResults(_file, info,
+    PrintResults(_file, info,
           0, // weight
           rating,
-          showFreq, showFreq ? (specifiedFreq != 0 ? specifiedFreq : cpuFreq) : 0, NULL);
-    }
-    RINOK(_file->CheckBreak());
+          showFreq, showFreq ? (specifiedFreq != 0 ? specifiedFreq : CpuFreqRes) : 0, NULL);
+    RINOK(_file->CheckBreak())
   }
 
   return S_OK;
@@ -3017,7 +3379,7 @@ static HRESULT CrcBench(
     const UInt32 *checkSum,
     const COneMethodInfo &method,
     IBenchPrintCallback *_file,
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     const CAffinityMode *affinityMode,
     #endif
     bool showRating,
@@ -3027,7 +3389,7 @@ static HRESULT CrcBench(
   if (numThreads == 0)
     numThreads = 1;
 
-  #ifdef _7ZIP_ST
+  #ifdef Z7_ST
   numThreads = 1;
   #endif
 
@@ -3041,7 +3403,7 @@ static HRESULT CrcBench(
 
   /*
   // if will generate random data in each thread, instead of global data
-  CAlignedBuffer buffer;
+  CMidAlignedBuffer buffer;
   if (!fileData)
   {
     ALLOC_WITH_HRESULT(&buffer, bufferSize)
@@ -3051,14 +3413,14 @@ static HRESULT CrcBench(
   */
 
   const size_t bsize = (bufferSize == 0 ? 1 : bufferSize);
-  UInt64 numIterations = complexInCommands * 256 / complexity / bsize;
+  UInt64 numIterations = complexInCommands * k_Hash_Complex_Mult / complexity / bsize;
   if (numIterations == 0)
     numIterations = 1;
 
   CBenchInfoCalc progressInfoSpec;
   CBenchInfo info;
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   bool mtEncMode = (numThreads > 1) || affinityMode->NeedAffinity();
 
   if (mtEncMode)
@@ -3077,14 +3439,14 @@ static HRESULT CrcBench(
     {
       CCrcInfo &ci = threads.Items[i];
       AString name;
-      RINOK(CreateHasher(EXTERNAL_CODECS_LOC_VARS hashID, name, ci.Hasher));
+      RINOK(CreateHasher(EXTERNAL_CODECS_LOC_VARS hashID, name, ci.Hasher))
       if (!ci.Hasher)
         return E_NOTIMPL;
       CMyComPtr<ICompressSetCoderProperties> scp;
       ci.Hasher.QueryInterface(IID_ICompressSetCoderProperties, &scp);
       if (scp)
       {
-        RINOK(method.SetCoderProps(scp));
+        RINOK(method.SetCoderProps(scp))
       }
 
       ci.Callback = _file;
@@ -3099,7 +3461,7 @@ static HRESULT CrcBench(
       }
 
       #ifdef USE_ALLOCA
-      ci.AllocaSize = (i * 16 * 21) & 0x7FF;
+      ci.AllocaSize = BENCH_ALLOCA_VALUE(i);
       #endif
     }
 
@@ -3122,7 +3484,7 @@ static HRESULT CrcBench(
       WRes wres = ci.ReadyEvent.Lock();
       if (wres != 0)
         return HRESULT_FROM_WIN32(wres);
-      RINOK(ci.Res);
+      RINOK(ci.Res)
     }
 
     progressInfoSpec.SetStartTime();
@@ -3135,7 +3497,7 @@ static HRESULT CrcBench(
     
     for (i = 0; i < numThreads; i++)
     {
-      RINOK(threads.Items[i].Res);
+      RINOK(threads.Items[i].Res)
       if (i != 0)
         if (threads.Items[i].CheckSum_Res !=
             threads.Items[i - 1].CheckSum_Res)
@@ -3147,20 +3509,20 @@ static HRESULT CrcBench(
   {
     CMyComPtr<IHasher> hasher;
     AString name;
-    RINOK(CreateHasher(EXTERNAL_CODECS_LOC_VARS hashID, name, hasher));
+    RINOK(CreateHasher(EXTERNAL_CODECS_LOC_VARS hashID, name, hasher))
     if (!hasher)
       return E_NOTIMPL;
     CMyComPtr<ICompressSetCoderProperties> scp;
     hasher.QueryInterface(IID_ICompressSetCoderProperties, &scp);
     if (scp)
     {
-      RINOK(method.SetCoderProps(scp));
+      RINOK(method.SetCoderProps(scp))
     }
     CCrcInfo_Base crcib;
     crcib.CreateLocalBuf = false;
-    RINOK(crcib.Generate(fileData, bufferSize));
+    RINOK(crcib.Generate(fileData, bufferSize))
     progressInfoSpec.SetStartTime();
-    RINOK(crcib.CrcProcess(numIterations, checkSum, hasher, _file));
+    RINOK(crcib.CrcProcess(numIterations, checkSum, hasher, _file))
     progressInfoSpec.SetFinishTime(info);
   }
 
@@ -3184,7 +3546,7 @@ static HRESULT CrcBench(
           benchWeight, rating,
           showFreq, cpuFreq, encodeRes);
     }
-    RINOK(_file->CheckBreak());
+    RINOK(_file->CheckBreak())
   }
 
   speed = info.GetSpeed(unpSizeThreads);
@@ -3197,20 +3559,23 @@ static HRESULT CrcBench(
 
 static HRESULT TotalBench_Hash(
     DECL_EXTERNAL_CODECS_LOC_VARS
+    const COneMethodInfo &methodMask,
     UInt64 complexInCommands,
     UInt32 numThreads,
     size_t bufSize,
     const Byte *fileData,
     IBenchPrintCallback *printCallback, CBenchCallbackToPrint *callback,
-    #ifndef _7ZIP_ST
+    #ifndef Z7_ST
     const CAffinityMode *affinityMode,
     #endif
     CTotalBenchRes *encodeRes,
     bool showFreq, UInt64 cpuFreq)
 {
-  for (unsigned i = 0; i < ARRAY_SIZE(g_Hash); i++)
+  for (unsigned i = 0; i < Z7_ARRAY_SIZE(g_Hash); i++)
   {
     const CBenchHash &bench = g_Hash[i];
+    if (!DoesWildcardMatchName_NoCase(methodMask.MethodName, bench.Name))
+      continue;
     PrintLeft(*callback->_file, bench.Name, kFieldSize_Name);
     // callback->BenchProps.DecComplexUnc = bench.DecComplexUnc;
     // callback->BenchProps.DecComplexCompr = bench.DecComplexCompr;
@@ -3219,11 +3584,11 @@ static HRESULT TotalBench_Hash(
     COneMethodInfo method;
     NCOM::CPropVariant propVariant;
     propVariant = bench.Name;
-    RINOK(method.ParseMethodFromPROPVARIANT(UString(), propVariant));
+    RINOK(method.ParseMethodFromPROPVARIANT(UString(), propVariant))
 
     UInt64 speed, usage;
 
-    HRESULT res = CrcBench(
+    const HRESULT res = CrcBench(
         EXTERNAL_CODECS_LOC_VARS
         complexInCommands,
         numThreads, bufSize, fileData,
@@ -3232,7 +3597,7 @@ static HRESULT TotalBench_Hash(
         (!fileData && bufSize == (1 << kNumHashDictBits)) ? &bench.CheckSum : NULL,
         method,
         printCallback,
-     #ifndef _7ZIP_ST
+     #ifndef Z7_ST
         affinityMode,
      #endif
         true, // showRating
@@ -3243,7 +3608,7 @@ static HRESULT TotalBench_Hash(
     }
     else
     {
-      RINOK(res);
+      RINOK(res)
     }
     callback->NewLine();
   }
@@ -3253,7 +3618,8 @@ static HRESULT TotalBench_Hash(
 struct CTempValues
 {
   UInt64 *Values;
-  CTempValues(UInt32 num) { Values = new UInt64[num]; }
+  CTempValues(): Values(NULL) {}
+  void Alloc(UInt32 num) { Values = new UInt64[num]; }
   ~CTempValues() { delete []Values; }
 };
 
@@ -3284,15 +3650,39 @@ static void Print_Usage_and_Threads(IBenchPrintCallback &f, UInt64 usage, UInt32
 }
 
 
+static void Print_Delimiter(IBenchPrintCallback &f)
+{
+  f.Print(" |");
+}
+
+static void Print_Pow(IBenchPrintCallback &f, unsigned pow)
+{
+  char s[16];
+  ConvertUInt32ToString(pow, s);
+  unsigned pos = MyStringLen(s);
+  s[pos++] = ':';
+  s[pos] = 0;
+  PrintLeft(f, s, kFieldSize_SmallName); // 4
+}
+
+static void Bench_BW_Print_Usage_Speed(IBenchPrintCallback &f,
+    UInt64 usage, UInt64 speed)
+{
+  PrintUsage(f, usage, kFieldSize_Usage);
+  PrintNumber(f, speed / 1000000, kFieldSize_CrcSpeed);
+}
+
+
 HRESULT Bench(
     DECL_EXTERNAL_CODECS_LOC_VARS
     IBenchPrintCallback *printCallback,
     IBenchCallback *benchCallback,
-    // IBenchFreqCallback *freqCallback,
     const CObjectVector<CProperty> &props,
     UInt32 numIterations,
-    bool multiDict)
+    bool multiDict,
+    IBenchFreqCallback *freqCallback)
 {
+  // for (int y = 0; y < 10000; y++)
   if (!CrcInternalTest())
     return E_FAIL;
 
@@ -3302,7 +3692,7 @@ HRESULT Bench(
   NSystem::CProcessAffinity threadsInfo;
   threadsInfo.InitST();
 
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
 
   if (threadsInfo.Get() && threadsInfo.GetNumProcessThreads() != 0)
     numCPUs = threadsInfo.GetNumProcessThreads();
@@ -3335,14 +3725,16 @@ HRESULT Bench(
   UInt64 complexInCommands = kComplexInCommands;
   UInt32 numThreads_Start = 1;
   
-  #ifndef _7ZIP_ST
+  #ifndef Z7_ST
   CAffinityMode affinityMode;
   #endif
 
 
   COneMethodInfo method;
 
-  CAlignedBuffer fileDataBuffer;
+  CMidAlignedBuffer fileDataBuffer;
+  bool use_fileData = false;
+  bool isFixedDict = false;
 
   {
   unsigned i;
@@ -3395,7 +3787,10 @@ HRESULT Bench(
           return E_INVALIDARG;
       }
 
-      ALLOC_WITH_HRESULT(&fileDataBuffer, len);
+      // (len == 0) is allowed. Also it's allowed if Alloc(0) returns NULL here
+
+      ALLOC_WITH_HRESULT(&fileDataBuffer, len)
+      use_fileData = true;
       
       {
         size_t processed;
@@ -3413,7 +3808,7 @@ HRESULT Bench(
     
     if (name.IsEqualTo("time"))
     {
-      RINOK(ParsePropToUInt32(UString(), propVariant, testTimeMs));
+      RINOK(ParsePropToUInt32(UString(), propVariant, testTimeMs))
       needSetComplexity = true;
       testTimeMs *= 1000;
       continue;
@@ -3421,7 +3816,7 @@ HRESULT Bench(
 
     if (name.IsEqualTo("timems"))
     {
-      RINOK(ParsePropToUInt32(UString(), propVariant, testTimeMs));
+      RINOK(ParsePropToUInt32(UString(), propVariant, testTimeMs))
       needSetComplexity = true;
       continue;
     }
@@ -3429,33 +3824,38 @@ HRESULT Bench(
     if (name.IsEqualTo("tic"))
     {
       UInt32 v;
-      RINOK(ParsePropToUInt32(UString(), propVariant, v));
+      RINOK(ParsePropToUInt32(UString(), propVariant, v))
       if (v >= 64)
         return E_INVALIDARG;
       complexInCommands = (UInt64)1 << v;
       continue;
     }
 
-    if (name.IsEqualTo("ds"))
+    const bool isCurrent_fixedDict = name.IsEqualTo("df");
+    if (isCurrent_fixedDict)
+      isFixedDict = true;
+    if (isCurrent_fixedDict || name.IsEqualTo("ds"))
     {
-      RINOK(ParsePropToUInt32(UString(), propVariant, startDicLog));
+      RINOK(ParsePropToUInt32(UString(), propVariant, startDicLog))
+      if (startDicLog > 32)
+        return E_INVALIDARG;
       startDicLog_Defined = true;
       continue;
     }
 
     if (name.IsEqualTo("mts"))
     {
-      RINOK(ParsePropToUInt32(UString(), propVariant, numThreads_Start));
+      RINOK(ParsePropToUInt32(UString(), propVariant, numThreads_Start))
       continue;
     }
 
     if (name.IsEqualTo("af"))
     {
       UInt32 bundle;
-      RINOK(ParsePropToUInt32(UString(), propVariant, bundle));
+      RINOK(ParsePropToUInt32(UString(), propVariant, bundle))
       if (bundle > 0 && bundle < numCPUs)
       {
-        #ifndef _7ZIP_ST
+        #ifndef Z7_ST
         affinityMode.SetLevels(numCPUs, 2);
         affinityMode.NumBundleThreads = bundle;
         #endif
@@ -3466,7 +3866,7 @@ HRESULT Bench(
     if (name.IsEqualTo("freq"))
     {
       UInt32 freq32 = 0;
-      RINOK(ParsePropToUInt32(UString(), propVariant, freq32));
+      RINOK(ParsePropToUInt32(UString(), propVariant, freq32))
       if (freq32 == 0)
         return E_INVALIDARG;
       specifiedFreq = (UInt64)freq32 * 1000000;
@@ -3483,7 +3883,7 @@ HRESULT Bench(
 
     if (name.IsPrefixedBy_Ascii_NoCase("mt"))
     {
-      UString s = name.Ptr(2);
+      const UString s = name.Ptr(2);
       if (s.IsEqualTo("*")
           || (s.IsEmpty()
             && propVariant.vt == VT_BSTR
@@ -3492,19 +3892,28 @@ HRESULT Bench(
         multiThreadTests = true;
         continue;
       }
-      #ifndef _7ZIP_ST
-      RINOK(ParseMtProp(s, propVariant, numCPUs, numThreadsSpecified));
+      #ifndef Z7_ST
+      RINOK(ParseMtProp(s, propVariant, numCPUs, numThreadsSpecified))
       #endif
       continue;
     }
     
-    RINOK(method.ParseMethodFromPROPVARIANT(name, propVariant));
+    RINOK(method.ParseMethodFromPROPVARIANT(name, propVariant))
   }
   }
 
   if (printCallback)
   {
     AString s;
+    
+#if 1 || !defined(Z7_MSC_VER_ORIGINAL) || (Z7_MSC_VER_ORIGINAL >= 1900)
+    s += "Compiler: ";
+    GetCompiler(s);
+    printCallback->Print(s);
+    printCallback->NewLine();
+    s.Empty();
+#endif
+
     GetSystemInfoText(s);
     printCallback->Print(s);
     printCallback->NewLine();
@@ -3512,10 +3921,10 @@ HRESULT Bench(
 
   if (printCallback)
   {
-    printCallback->Print("CPU Freq:");
+    printCallback->Print("1T CPU Freq (MHz):");
   }
 
-  if (printCallback /* || freqCallback */)
+  if (printCallback || freqCallback)
   {
     UInt64 numMilCommands = 1 << 6;
     if (specifiedFreq != 0)
@@ -3527,7 +3936,7 @@ HRESULT Bench(
     for (int jj = 0;; jj++)
     {
       if (printCallback)
-        RINOK(printCallback->CheckBreak());
+        RINOK(printCallback->CheckBreak())
 
       UInt64 start = ::GetTimeCount();
       UInt32 sum = (UInt32)start;
@@ -3543,6 +3952,7 @@ HRESULT Bench(
         start = 1;
       const UInt64 freq = GetFreq();
       // mips is constant in some compilers
+      const UInt64 hzVal = MyMultDiv64(numMilCommands * 1000000, freq, start);
       const UInt64 mipsVal = numMilCommands * freq / start;
       if (printCallback)
       {
@@ -3556,10 +3966,10 @@ HRESULT Bench(
           PrintNumber(*printCallback, mipsVal, 5);
         }
       }
-      /*
       if (freqCallback)
-        freqCallback->AddCpuFreq(mipsVal);
-      */
+      {
+        RINOK(freqCallback->AddCpuFreq(1, hzVal, kBenchmarkUsageMult))
+      }
 
       if (jj >= 1)
       {
@@ -3573,7 +3983,10 @@ HRESULT Bench(
         if (start >= freq * 16)
         {
           printCallback->Print(" (Cmplx)");
-          needSetComplexity = true;
+          if (!freqCallback) // we don't want complexity change for old gui lzma benchmark
+          {
+            needSetComplexity = true;
+          }
           needStop = true;
         }
         if (needSetComplexity)
@@ -3583,7 +3996,116 @@ HRESULT Bench(
         numMilCommands <<= 1;
       }
     }
+    if (freqCallback)
+    {
+      RINOK(freqCallback->FreqsFinished(1))
+    }
   }
+
+  if (numThreadsSpecified >= 2)
+  if (printCallback || freqCallback)
+  {
+    if (printCallback)
+      printCallback->NewLine();
+
+    /* it can show incorrect frequency for HT threads.
+       so we reduce freq test to (numCPUs / 2) */
+
+    UInt32 numThreads = (numThreadsSpecified >= numCPUs / 2 ? numCPUs / 2 : numThreadsSpecified);
+    if (numThreads < 1)
+      numThreads = 1;
+   
+    if (printCallback)
+    {
+      char s[128];
+      ConvertUInt64ToString(numThreads, s);
+      printCallback->Print(s);
+      printCallback->Print("T CPU Freq (MHz):");
+    }
+    UInt64 numMilCommands = 1 <<
+          #ifdef _DEBUG
+            7;
+          #else
+            10;
+          #endif
+
+    if (specifiedFreq != 0)
+    {
+      while (numMilCommands > 1 && specifiedFreq < (numMilCommands * 1000000))
+        numMilCommands >>= 1;
+    }
+
+    // for (int jj = 0;; jj++)
+    for (;;)
+    {
+      if (printCallback)
+        RINOK(printCallback->CheckBreak())
+
+      {
+        // PrintLeft(f, "CPU", kFieldSize_Name);
+        
+        // UInt32 resVal;
+        
+        CFreqBench fb;
+        fb.complexInCommands = numMilCommands * 1000000;
+        fb.numThreads = numThreads;
+        // showFreq;
+        // fb.showFreq = (freqTest == kNumCpuTests - 1 || specifiedFreq != 0);
+        fb.showFreq = true;
+        fb.specifiedFreq = 1;
+
+        const HRESULT res = fb.FreqBench(NULL /* printCallback */
+            #ifndef Z7_ST
+              , &affinityMode
+            #endif
+            );
+        RINOK(res)
+
+        if (freqCallback)
+        {
+          RINOK(freqCallback->AddCpuFreq(numThreads, fb.CpuFreqRes, fb.UsageRes))
+        }
+
+        if (printCallback)
+        {
+          /*
+          if (realDelta == 0)
+          {
+            printCallback->Print(" -");
+          }
+          else
+          */
+          {
+            // PrintNumber(*printCallback, start, 0);
+            PrintUsage(*printCallback, fb.UsageRes, 3);
+            printCallback->Print("%");
+            PrintNumber(*printCallback, fb.CpuFreqRes / 1000000, 0);
+            printCallback->Print("  ");
+
+            // PrintNumber(*printCallback, fb.UsageRes, 5);
+          }
+        }
+      }
+      // if (jj >= 1)
+      {
+        const bool needStop = (numMilCommands >= (1 <<
+          #ifdef _DEBUG
+            7
+          #else
+            11
+          #endif
+          ));
+        if (needStop)
+          break;
+        numMilCommands <<= 1;
+      }
+    }
+    if (freqCallback)
+    {
+      RINOK(freqCallback->FreqsFinished(numThreads))
+    }
+  }
+
 
   if (printCallback)
   {
@@ -3597,22 +4119,38 @@ HRESULT Bench(
   if (numThreadsSpecified < 1 || numThreadsSpecified > kNumThreadsMax)
     return E_INVALIDARG;
 
-  UInt32 dict;
-  bool dictIsDefined = method.Get_DicSize(dict);
+  UInt64 dict = (UInt64)1 << startDicLog;
+  const bool dictIsDefined = (isFixedDict || method.Get_DicSize(dict));
 
-  if (method.MethodName.IsEmpty())
-    method.MethodName = "LZMA";
+  const unsigned level = method.GetLevel();
+
+  AString &methodName = method.MethodName;
+  const AString original_MethodName = methodName;
+  if (methodName.IsEmpty())
+    methodName = "LZMA";
 
   if (benchCallback)
   {
     CBenchProps benchProps;
     benchProps.SetLzmaCompexity();
-    UInt32 dictSize = method.Get_Lzma_DicSize();
-    UInt32 uncompressedDataSize = kAdditionalSize + dictSize;
+    const UInt64 dictSize = method.Get_Lzma_DicSize();
+
+    size_t uncompressedDataSize;
+    if (use_fileData)
+    {
+      uncompressedDataSize = fileDataBuffer.Size();
+    }
+    else
+    {
+      uncompressedDataSize = kAdditionalSize + (size_t)dictSize;
+      if (uncompressedDataSize < dictSize)
+        return E_INVALIDARG;
+    }
+
     return MethodBench(
         EXTERNAL_CODECS_LOC_VARS
         complexInCommands,
-      #ifndef _7ZIP_ST
+      #ifndef Z7_ST
         true, numThreadsSpecified,
         &affinityMode,
       #endif
@@ -3621,13 +4159,28 @@ HRESULT Bench(
         kOldLzmaDictBits, printCallback, benchCallback, &benchProps);
   }
 
-  AString methodName (method.MethodName);
   if (methodName.IsEqualTo_Ascii_NoCase("CRC"))
     methodName = "crc32";
-  method.MethodName = methodName;
+
   CMethodId hashID;
-  
-  if (FindHashMethod(EXTERNAL_CODECS_LOC_VARS methodName, hashID))
+  const bool isHashMethod = FindHashMethod(EXTERNAL_CODECS_LOC_VARS methodName, hashID);
+  int codecIndex = -1;
+  bool isFilter = false;
+  if (!isHashMethod)
+  {
+    UInt32 numStreams;
+    codecIndex = FindMethod_Index(EXTERNAL_CODECS_LOC_VARS original_MethodName,
+        true,  // encode
+        hashID, numStreams, isFilter);
+    // we can allow non filter for BW tests
+    if (!isFilter) codecIndex = -1;
+  }
+
+  CBenchCallbackToPrint callback;
+  callback.Init();
+  callback._file = printCallback;
+
+  if (isHashMethod || codecIndex != -1)
   {
     if (!printCallback)
       return S_FALSE;
@@ -3636,7 +4189,7 @@ HRESULT Bench(
     UInt64 dict64 = dict;
     if (!dictIsDefined)
       dict64 = (1 << 27);
-    if (fileDataBuffer.IsAllocated())
+    if (use_fileData)
     {
       if (!dictIsDefined)
         dict64 = fileDataBuffer.Size();
@@ -3644,17 +4197,27 @@ HRESULT Bench(
         dict64 = fileDataBuffer.Size();
     }
 
-    // methhodName.RemoveChar(L'-');
-    UInt32 complexity = 10000;
-    const UInt32 *checkSum = NULL;
+    for (;;)
     {
-      unsigned i;
-      for (i = 0; i < ARRAY_SIZE(g_Hash); i++)
+      const int index = method.FindProp(NCoderPropID::kDictionarySize);
+      if (index < 0)
+        break;
+      method.Props.Delete((unsigned)index);
+    }
+
+    // methodName.RemoveChar(L'-');
+    Int32 complexity = 16 * k_Hash_Complex_Mult; // for unknown hash method
+    const UInt32 *checkSum = NULL;
+    int benchIndex = -1;
+    
+    if (isHashMethod)
+    {
+      for (unsigned i = 0; i < Z7_ARRAY_SIZE(g_Hash); i++)
       {
         const CBenchHash &h = g_Hash[i];
         AString benchMethod (h.Name);
         AString benchProps;
-        int propPos = benchMethod.Find(':');
+        const int propPos = benchMethod.Find(':');
         if (propPos >= 0)
         {
           benchProps = benchMethod.Ptr((unsigned)(propPos + 1));
@@ -3663,43 +4226,80 @@ HRESULT Bench(
 
         if (AreSameMethodNames(benchMethod, methodName))
         {
-          bool isMainMathed = method.PropsString.IsEmpty();
-          if (isMainMathed)
-            isMainMathed = !checkSum
-                || (benchMethod.IsEqualTo_Ascii_NoCase("crc32") && benchProps.IsEqualTo_Ascii_NoCase("8"));
           const bool sameProps = method.PropsString.IsEqualTo_Ascii_NoCase(benchProps);
-          if (sameProps || isMainMathed)
+          /*
+          bool isMainMethod = method.PropsString.IsEmpty();
+          if (isMainMethod)
+            isMainMethod = !checkSum
+                || (benchMethod.IsEqualTo_Ascii_NoCase("crc32") && benchProps.IsEqualTo_Ascii_NoCase("8"));
+          if (sameProps || isMainMethod)
+          */
           {
-            complexity = h.Complex;
+            complexity = (Int32)h.Complex;
             checkSum = &h.CheckSum;
+            if (sameProps)
+              break;
+            /*
+            if property. is not specified, we use the complexity
+            for latest fastest method (crc32:64)
+            */
+          }
+        }
+      }
+      // if (!checkSum) return E_NOTIMPL;
+    }
+    else
+    {
+      for (unsigned i = 0; i < Z7_ARRAY_SIZE(g_Bench); i++)
+      {
+        const CBenchMethod &bench = g_Bench[i];
+        AString benchMethod (bench.Name);
+        AString benchProps;
+        const int propPos = benchMethod.Find(':');
+        if (propPos >= 0)
+        {
+          benchProps = benchMethod.Ptr((unsigned)(propPos + 1));
+          benchMethod.DeleteFrom((unsigned)propPos);
+        }
+
+        if (AreSameMethodNames(benchMethod, methodName))
+        {
+          const bool sameProps = method.PropsString.IsEqualTo_Ascii_NoCase(benchProps);
+          // bool isMainMethod = method.PropsString.IsEmpty();
+          // if (sameProps || isMainMethod)
+          {
+            benchIndex = (int)i;
             if (sameProps)
               break;
           }
         }
       }
-      if (!checkSum)
-        return E_NOTIMPL;
+      // if (benchIndex < 0) return E_NOTIMPL;
     }
 
     {
-      UInt64 usage = 1 << 20;
+      /* we count usage only for crc and filter. non-filters are not supported */
+      UInt64 usage = (1 << 20);
       UInt64 bufSize = dict64;
-      if (fileDataBuffer.IsAllocated())
+      UInt32 numBlocks = isHashMethod ? 1 : 3;
+      if (use_fileData)
       {
         usage += fileDataBuffer.Size();
         if (bufSize > fileDataBuffer.Size())
           bufSize = fileDataBuffer.Size();
-        if (numThreadsSpecified != 1)
-          usage += bufSize * numThreadsSpecified * (k_Crc_CreateLocalBuf_For_File ? 1 : 0);
+        if (isHashMethod)
+        {
+          numBlocks = 0;
+          #ifndef Z7_ST
+          if (numThreadsSpecified != 1)
+            numBlocks = (k_Crc_CreateLocalBuf_For_File ? 1 : 0);
+          #endif
+        }
       }
-      else
-        usage += numThreadsSpecified * bufSize;
+      usage += numThreadsSpecified * bufSize * numBlocks;
       Print_Usage_and_Threads(f, usage, numThreadsSpecified);
     }
-    
-    f.NewLine();
-    
-    const unsigned kFieldSize_CrcSpeed = 7;
+
     CUIntVector numThreadsVector;
     {
       unsigned nt = numThreads_Start;
@@ -3708,136 +4308,225 @@ HRESULT Bench(
         if (nt > numThreadsSpecified)
           break;
         numThreadsVector.Add(nt);
-        unsigned next = nt * 2;
-        UInt32 ntHalf= numThreadsSpecified / 2;
+        const unsigned next = nt * 2;
+        const UInt32 ntHalf= numThreadsSpecified / 2;
         if (ntHalf > nt && ntHalf < next)
           numThreadsVector.Add(ntHalf);
         if (numThreadsSpecified > nt && numThreadsSpecified < next)
           numThreadsVector.Add(numThreadsSpecified);
         nt = next;
       }
+    }
+
+    unsigned numColumns = isHashMethod ? 1 : 2;
+    CTempValues speedTotals;
+    CTempValues usageTotals;
+    {
+      const unsigned numItems = numThreadsVector.Size() * numColumns;
+      speedTotals.Alloc(numItems);
+      usageTotals.Alloc(numItems);
+      for (unsigned i = 0; i < numItems; i++)
       {
-        f.NewLine();
-        f.Print("THRD");
-        FOR_VECTOR (ti, numThreadsVector)
-        {
-          PrintNumber(f, numThreadsVector[ti], 1 + kFieldSize_Usage + kFieldSize_CrcSpeed);
-        }
-      }
-      {
-        f.NewLine();
-        f.Print("    ");
-        FOR_VECTOR (ti, numThreadsVector)
-        {
-          PrintRight(f, "Usage", kFieldSize_Usage + 1);
-          PrintRight(f, "BW", kFieldSize_CrcSpeed + 1);
-        }
-      }
-      {
-        f.NewLine();
-        f.Print("Size");
-        FOR_VECTOR (ti, numThreadsVector)
-        {
-          PrintRight(f, "%", kFieldSize_Usage + 1);
-          PrintRight(f, "MB/s", kFieldSize_CrcSpeed + 1);
-        }
+        speedTotals.Values[i] = 0;
+        usageTotals.Values[i] = 0;
       }
     }
-    
-    f.NewLine();
-    f.NewLine();
 
-    CTempValues speedTotals(numThreadsVector.Size());
-    CTempValues usageTotals(numThreadsVector.Size());
+    f.NewLine();
+    for (unsigned line = 0; line < 3; line++)
     {
+      f.NewLine();
+      f.Print(line == 0 ? "THRD" : line == 1 ? "    " : "Size");
       FOR_VECTOR (ti, numThreadsVector)
       {
-        speedTotals.Values[ti] = 0;
-        usageTotals.Values[ti] = 0;
+        if (ti != 0)
+          Print_Delimiter(f);
+        if (line == 0)
+        {
+          PrintSpaces(f, (kFieldSize_CrcSpeed + kFieldSize_Usage + 2) * (numColumns - 1));
+          PrintNumber(f, numThreadsVector[ti], 1 + kFieldSize_Usage + kFieldSize_CrcSpeed);
+        }
+        else
+        {
+          for (unsigned c = 0; c < numColumns; c++)
+          {
+            PrintRight(f, line == 1 ? "Usage" : "%",    kFieldSize_Usage + 1);
+            PrintRight(f, line == 1 ? "BW"    : "MB/s", kFieldSize_CrcSpeed + 1);
+          }
+        }
       }
     }
-    
+    f.NewLine();
+
     UInt64 numSteps = 0;
 
-    for (UInt32 i = 0; i < numIterations; i++)
+    // for (UInt32 iter = 0; iter < numIterations; iter++)
+    // {
+    unsigned pow = 10; // kNumHashDictBits
+    if (startDicLog_Defined)
+      pow = startDicLog;
+
+    // #define NUM_SUB_BITS 2
+    // pow <<= NUM_SUB_BITS;
+    for (;; pow++)
     {
-      unsigned pow = 10; // kNumHashDictBits
-      if (startDicLog_Defined)
-        pow = startDicLog;
-      for (;; pow++)
+      const UInt64 bufSize = (UInt64)1 << pow;
+      // UInt64 bufSize = (UInt64)1 << (pow >> NUM_SUB_BITS);
+      // bufSize += ((UInt64)pow & ((1 << NUM_SUB_BITS) - 1)) << ((pow >> NUM_SUB_BITS) - NUM_SUB_BITS);
+
+      size_t dataSize = fileDataBuffer.Size();
+      if (dataSize > bufSize || !use_fileData)
+        dataSize = (size_t)bufSize;
+      
+      for (UInt32 iter = 0; iter < numIterations; iter++)
       {
-        const UInt64 bufSize = (UInt64)1 << pow;
-        char s[16];
-        ConvertUInt32ToString(pow, s);
-        unsigned pos = MyStringLen(s);
-        s[pos++] = ':';
-        s[pos++] = ' ';
-        s[pos] = 0;
-        PrintRight(f, s, 4);
-
-        size_t dataSize = fileDataBuffer.Size();
-        if (dataSize > bufSize || !fileDataBuffer.IsAllocated())
-          dataSize = (size_t)bufSize;
-
+        Print_Pow(f, pow);
+        // PrintNumber(f, bufSize >> 10, 4);
+ 
         FOR_VECTOR (ti, numThreadsVector)
         {
-          RINOK(f.CheckBreak());
-          const UInt32 t = numThreadsVector[ti];
-          UInt64 speed = 0;
-          UInt64 usage = 0;
-
-          HRESULT res = CrcBench(EXTERNAL_CODECS_LOC_VARS complexInCommands,
-              t,
+          RINOK(f.CheckBreak())
+          const UInt32 numThreads = numThreadsVector[ti];
+          if (isHashMethod)
+          {
+            UInt64 speed = 0;
+            UInt64 usage = 0;
+            const HRESULT res = CrcBench(EXTERNAL_CODECS_LOC_VARS complexInCommands,
+              numThreads,
               dataSize, (const Byte *)fileDataBuffer,
               speed, usage,
-              complexity,
+              (UInt32)complexity,
               1, // benchWeight,
-              (pow == kNumHashDictBits && !fileDataBuffer.IsAllocated()) ? checkSum : NULL,
+              (pow == kNumHashDictBits && !use_fileData) ? checkSum : NULL,
               method,
               &f,
-            #ifndef _7ZIP_ST
+            #ifndef Z7_ST
               &affinityMode,
             #endif
               false, // showRating
               NULL, false, 0);
-          
-          RINOK(res);
+            RINOK(res)
+            
+            if (ti != 0)
+              Print_Delimiter(f);
+            
+            Bench_BW_Print_Usage_Speed(f, usage, speed);
+            speedTotals.Values[ti] += speed;
+            usageTotals.Values[ti] += usage;
+          }
+          else
+          {
+            {
+              unsigned keySize = 32;
+                   if (IsString1PrefixedByString2(methodName, "AES128")) keySize = 16;
+              else if (IsString1PrefixedByString2(methodName, "AES192")) keySize = 24;
+              callback.BenchProps.KeySize = keySize;
+            }
 
-          PrintUsage(f, usage, kFieldSize_Usage);
-          PrintNumber(f, speed / 1000000, kFieldSize_CrcSpeed);
-          speedTotals.Values[ti] += speed;
-          usageTotals.Values[ti] += usage;
+            COneMethodInfo method2 = method;
+            unsigned bench_DictBits;
+
+            if (benchIndex >= 0)
+            {
+              const CBenchMethod &bench = g_Bench[benchIndex];
+              callback.BenchProps.EncComplex = bench.EncComplex;
+              callback.BenchProps.DecComplexUnc = bench.DecComplexUnc;
+              callback.BenchProps.DecComplexCompr = bench.DecComplexCompr;
+              bench_DictBits = bench.DictBits;
+              // bench_DictBits = kOldLzmaDictBits; = 32 default : for debug
+            }
+            else
+            {
+              bench_DictBits = kOldLzmaDictBits; // = 32 default
+              if (isFilter)
+              {
+                const unsigned k_UnknownCoderComplexity = 4;
+                callback.BenchProps.EncComplex = k_UnknownCoderComplexity;
+                callback.BenchProps.DecComplexUnc = k_UnknownCoderComplexity;
+              }
+              else
+              {
+                callback.BenchProps.EncComplex = 1 << 10;
+                callback.BenchProps.DecComplexUnc = 1 << 6;
+              }
+              callback.BenchProps.DecComplexCompr = 0;
+            }
+            callback.NeedPrint = false;
+
+            if (StringsAreEqualNoCase_Ascii(method2.MethodName, "LZMA"))
+            {
+              const NCOM::CPropVariant propVariant = (UInt32)pow;
+              RINOK(method2.ParseMethodFromPROPVARIANT((UString)"d", propVariant))
+            }
+
+            const HRESULT res = MethodBench(
+                EXTERNAL_CODECS_LOC_VARS
+                complexInCommands,
+              #ifndef Z7_ST
+                false, // oldLzmaBenchMode
+                numThreadsVector[ti],
+                &affinityMode,
+              #endif
+                method2,
+                dataSize, (const Byte *)fileDataBuffer,
+                bench_DictBits,
+                printCallback,
+                &callback,
+                &callback.BenchProps);
+            RINOK(res)
+
+            if (ti != 0)
+              Print_Delimiter(f);
+
+            for (unsigned i = 0; i < 2; i++)
+            {
+              const CBenchInfo &bi = callback.BenchInfo_Results[i];
+              const UInt64 usage = bi.GetUsage();
+              const UInt64 speed = bi.GetUnpackSizeSpeed();
+              usageTotals.Values[ti * 2 + i] += usage;
+              speedTotals.Values[ti * 2 + i] += speed;
+              Bench_BW_Print_Usage_Speed(f, usage, speed);
+            }
+          }
         }
 
         f.NewLine();
         numSteps++;
-        if (dataSize >= dict64)
-          break;
       }
+      if (dataSize >= dict64)
+        break;
     }
+
     if (numSteps != 0)
     {
-      f.NewLine();
       f.Print("Avg:");
       for (unsigned ti = 0; ti < numThreadsVector.Size(); ti++)
       {
-        PrintUsage(f, usageTotals.Values[ti] / numSteps, kFieldSize_Usage);
-        PrintNumber(f, speedTotals.Values[ti] / numSteps / 1000000, kFieldSize_CrcSpeed);
+        if (ti != 0)
+          Print_Delimiter(f);
+        for (unsigned i = 0; i < numColumns; i++)
+          Bench_BW_Print_Usage_Speed(f,
+              usageTotals.Values[ti * numColumns + i] / numSteps,
+              speedTotals.Values[ti * numColumns + i] / numSteps);
       }
       f.NewLine();
     }
+
     return S_OK;
   }
 
   bool use2Columns = false;
 
-  bool totalBenchMode = (method.MethodName.IsEqualTo_Ascii_NoCase("*"));
+  bool totalBenchMode = false;
   bool onlyHashBench = false;
-  if (method.MethodName.IsEqualTo_Ascii_NoCase("hash"))
+  if (methodName.IsEqualTo_Ascii_NoCase("hash"))
   {
     onlyHashBench = true;
+    methodName = "*";
     totalBenchMode = true;
   }
+  else if (methodName.Find('*') >= 0)
+    totalBenchMode = true;
 
   // ---------- Threads loop ----------
   for (unsigned threadsPassIndex = 0; threadsPassIndex < 3; threadsPassIndex++)
@@ -3868,10 +4557,6 @@ HRESULT Bench(
     }
   }
  
-  CBenchCallbackToPrint callback;
-  callback.Init();
-  callback._file = printCallback;
-  
   IBenchPrintCallback &f = *printCallback;
 
   if (threadsPassIndex > 0)
@@ -3880,7 +4565,7 @@ HRESULT Bench(
     f.NewLine();
   }
 
-  if (!dictIsDefined)
+  if (!dictIsDefined && !onlyHashBench)
   {
     const unsigned dicSizeLog_Main = (totalBenchMode ? 24 : 25);
     unsigned dicSizeLog = dicSizeLog_Main;
@@ -3891,10 +4576,10 @@ HRESULT Bench(
 
     if (ramSize_Defined)
     for (; dicSizeLog > kBenchMinDicLogSize; dicSizeLog--)
-      if (GetBenchMemoryUsage(numThreads, ((UInt32)1 << dicSizeLog), totalBenchMode) + (8 << 20) <= ramSize)
+      if (GetBenchMemoryUsage(numThreads, (int)level, ((UInt64)1 << dicSizeLog), totalBenchMode) + (8 << 20) <= ramSize)
         break;
 
-    dict = (UInt32)1 << dicSizeLog;
+    dict = (UInt64)1 << dicSizeLog;
 
     if (totalBenchMode && dicSizeLog != dicSizeLog_Main)
     {
@@ -3904,7 +4589,12 @@ HRESULT Bench(
     }
   }
 
-  Print_Usage_and_Threads(f, GetBenchMemoryUsage(numThreads, dict, totalBenchMode), numThreads);
+  Print_Usage_and_Threads(f,
+      onlyHashBench ?
+        GetBenchMemoryUsage_Hash(numThreads, dict) :
+        GetBenchMemoryUsage(numThreads, (int)level, dict, totalBenchMode),
+      numThreads);
+
   f.NewLine();
 
   f.NewLine();
@@ -3988,6 +4678,7 @@ HRESULT Bench(
   if (specifiedFreq != 0)
     cpuFreq = specifiedFreq;
 
+  // bool showTotalSpeed = false;
 
   if (totalBenchMode)
   {
@@ -4010,14 +4701,14 @@ HRESULT Bench(
         fb.showFreq = (freqTest == kNumCpuTests - 1 || specifiedFreq != 0);
         fb.specifiedFreq = specifiedFreq;
 
-        HRESULT res = fb.FreqBench(printCallback
-            #ifndef _7ZIP_ST
+        const HRESULT res = fb.FreqBench(printCallback
+            #ifndef Z7_ST
               , &affinityMode
             #endif
             );
-        RINOK(res);
+        RINOK(res)
 
-        cpuFreq = fb.cpuFreq;
+        cpuFreq = fb.CpuFreqRes;
         callback.NewLine();
 
         if (specifiedFreq != 0)
@@ -4037,46 +4728,52 @@ HRESULT Bench(
 
       if (!onlyHashBench)
       {
-        size_t dataSize = dict;
-        if (fileDataBuffer.IsAllocated())
+        size_t dataSize = (size_t)dict;
+        if (use_fileData)
         {
           dataSize = fileDataBuffer.Size();
           if (dictIsDefined && dataSize > dict)
-            dataSize = dict;
+            dataSize = (size_t)dict;
         }
 
-        HRESULT res = TotalBench(EXTERNAL_CODECS_LOC_VARS
-            complexInCommands,
-          #ifndef _7ZIP_ST
+        const HRESULT res = TotalBench(EXTERNAL_CODECS_LOC_VARS
+            method, complexInCommands,
+          #ifndef Z7_ST
             numThreads,
             &affinityMode,
           #endif
-            dictIsDefined || fileDataBuffer.IsAllocated(), // forceUnpackSize
+            dictIsDefined || use_fileData, // forceUnpackSize
             dataSize,
             (const Byte *)fileDataBuffer,
             printCallback, &callback);
-        RINOK(res);
+        RINOK(res)
       }
 
       {
         size_t dataSize = (size_t)1 << kNumHashDictBits;
         if (dictIsDefined)
-          dataSize = dict;
-        if (fileDataBuffer.IsAllocated())
+        {
+          dataSize = (size_t)dict;
+          if (dataSize != dict)
+            return E_OUTOFMEMORY;
+        }
+        if (use_fileData)
         {
           dataSize = fileDataBuffer.Size();
           if (dictIsDefined && dataSize > dict)
-            dataSize = dict;
+            dataSize = (size_t)dict;
         }
 
-        HRESULT res = TotalBench_Hash(EXTERNAL_CODECS_LOC_VARS complexInCommands, numThreads,
+        const HRESULT res = TotalBench_Hash(EXTERNAL_CODECS_LOC_VARS
+            method, complexInCommands,
+            numThreads,
             dataSize, (const Byte *)fileDataBuffer,
             printCallback, &callback,
-        #ifndef _7ZIP_ST
+        #ifndef Z7_ST
           &affinityMode,
         #endif
           &callback.EncodeRes, true, cpuFreq);
-        RINOK(res);
+        RINOK(res)
       }
 
       callback.NewLine();
@@ -4090,12 +4787,12 @@ HRESULT Bench(
         fb.showFreq = (specifiedFreq != 0);
         fb.specifiedFreq = specifiedFreq;
 
-        HRESULT res = fb.FreqBench(printCallback
-          #ifndef _7ZIP_ST
+        const HRESULT res = fb.FreqBench(printCallback
+          #ifndef Z7_ST
             , &affinityMode
           #endif
           );
-        RINOK(res);
+        RINOK(res)
         callback.NewLine();
       }
     }
@@ -4106,12 +4803,12 @@ HRESULT Bench(
     if (!methodName.IsEqualTo_Ascii_NoCase("LZMA"))
     {
       unsigned i;
-      for (i = 0; i < ARRAY_SIZE(g_Bench); i++)
+      for (i = 0; i < Z7_ARRAY_SIZE(g_Bench); i++)
       {
         const CBenchMethod &h = g_Bench[i];
         AString benchMethod (h.Name);
         AString benchProps;
-        int propPos = benchMethod.Find(':');
+        const int propPos = benchMethod.Find(':');
         if (propPos >= 0)
         {
           benchProps = benchMethod.Ptr((unsigned)(propPos + 1));
@@ -4126,14 +4823,16 @@ HRESULT Bench(
           {
             callback.BenchProps.EncComplex = h.EncComplex;
             callback.BenchProps.DecComplexCompr = h.DecComplexCompr;
-            callback.BenchProps.DecComplexUnc = h.DecComplexUnc;;
+            callback.BenchProps.DecComplexUnc = h.DecComplexUnc;
             needSetComplexity = false;
             break;
           }
         }
       }
-      if (i == ARRAY_SIZE(g_Bench))
+      /*
+      if (i == Z7_ARRAY_SIZE(g_Bench))
         return E_NOTIMPL;
+      */
     }
     if (needSetComplexity)
       callback.BenchProps.SetLzmaCompexity();
@@ -4143,20 +4842,15 @@ HRESULT Bench(
 
   for (unsigned i = 0; i < numIterations; i++)
   {
-    unsigned pow = (dict < ((UInt32)1 << startDicLog)) ? kBenchMinDicLogSize : (unsigned)startDicLog;
+    unsigned pow = (dict < GetDictSizeFromLog(startDicLog)) ? kBenchMinDicLogSize : (unsigned)startDicLog;
     if (!multiDict)
-      pow = 31;
-    while (((UInt32)1 << pow) > dict && pow > 0)
+      pow = 32;
+    while (GetDictSizeFromLog(pow) > dict && pow > 0)
       pow--;
-    for (; ((UInt32)1 << pow) <= dict; pow++)
+    for (; GetDictSizeFromLog(pow) <= dict; pow++)
     {
-      char s[16];
-      ConvertUInt32ToString(pow, s);
-      unsigned pos = MyStringLen(s);
-      s[pos++] = ':';
-      s[pos] = 0;
-      PrintLeft(f, s, kFieldSize_SmallName);
-      callback.DictSize = (UInt32)1 << pow;
+      Print_Pow(f, pow);
+      callback.DictSize = (UInt64)1 << pow;
 
       COneMethodInfo method2 = method;
 
@@ -4166,25 +4860,27 @@ HRESULT Bench(
         // method2 can have two different dictionary size properties.
         // And last property is main.
         NCOM::CPropVariant propVariant = (UInt32)pow;
-        RINOK(method2.ParseMethodFromPROPVARIANT((UString)"d", propVariant));
+        RINOK(method2.ParseMethodFromPROPVARIANT((UString)"d", propVariant))
       }
 
       size_t uncompressedDataSize;
-      if (fileDataBuffer.IsAllocated())
+      if (use_fileData)
       {
         uncompressedDataSize = fileDataBuffer.Size();
       }
       else
       {
-        uncompressedDataSize = callback.DictSize;
+        uncompressedDataSize = (size_t)callback.DictSize;
+        if (uncompressedDataSize != callback.DictSize)
+          return E_OUTOFMEMORY;
         if (uncompressedDataSize >= (1 << 18))
           uncompressedDataSize += kAdditionalSize;
       }
 
-      HRESULT res = MethodBench(
+      const HRESULT res = MethodBench(
           EXTERNAL_CODECS_LOC_VARS
           complexInCommands,
-        #ifndef _7ZIP_ST
+        #ifndef Z7_ST
           true, numThreads,
           &affinityMode,
         #endif
@@ -4192,7 +4888,7 @@ HRESULT Bench(
           uncompressedDataSize, (const Byte *)fileDataBuffer,
           kOldLzmaDictBits, printCallback, &callback, &callback.BenchProps);
       f.NewLine();
-      RINOK(res);
+      RINOK(res)
       if (!multiDict)
         break;
     }
@@ -4212,16 +4908,19 @@ HRESULT Bench(
   if (use2Columns)
   {
     PrintLeft(f, "Avr:", callback.NameFieldSize);
-    PrintTotals(f, showFreq, cpuFreq, callback.EncodeRes);
+    PrintTotals(f, showFreq, cpuFreq, !totalBenchMode, callback.EncodeRes);
     f.Print(kSep);
-    PrintTotals(f, showFreq, cpuFreq, callback.DecodeRes);
+    PrintTotals(f, showFreq, cpuFreq, !totalBenchMode, callback.DecodeRes);
     f.NewLine();
   }
   
   PrintLeft(f, "Tot:", callback.NameFieldSize);
   CTotalBenchRes midRes;
-  midRes.SetSum(callback.EncodeRes, callback.DecodeRes);
-  PrintTotals(f, showFreq, cpuFreq, midRes);
+  midRes = callback.EncodeRes;
+  midRes.Update_With_Res(callback.DecodeRes);
+
+  // midRes.SetSum(callback.EncodeRes, callback.DecodeRes);
+  PrintTotals(f, showFreq, cpuFreq, false, midRes);
   f.NewLine();
 
   }

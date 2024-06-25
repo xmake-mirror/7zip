@@ -3,12 +3,20 @@ include ../../LzmaDec_gcc.mak
 LOCAL_FLAGS_ST =
 MT_OBJS =
 
+ifdef SystemDrive
+IS_MINGW = 1
+else
+ifdef SYSTEMDRIVE
+# ifdef OS
+IS_MINGW = 1
+endif
+endif
 
 ifdef ST_MODE
 
-LOCAL_FLAGS_ST = -D_7ZIP_ST
+LOCAL_FLAGS_ST = -DZ7_ST
 
-ifdef SystemDrive
+ifdef IS_MINGW
 MT_OBJS = \
   $O/Threads.o \
 
@@ -18,13 +26,14 @@ else
 
 MT_OBJS = \
   $O/LzFindMt.o \
-  $O/StreamBinder.o \
-  $O/Synchronization.o \
-  $O/VirtThread.o \
+  $O/LzFindOpt.o \
+  $O/Threads.o \
   $O/MemBlocks.o \
   $O/OutMemStream.o \
   $O/ProgressMt.o \
-  $O/Threads.o \
+  $O/StreamBinder.o \
+  $O/Synchronization.o \
+  $O/VirtThread.o \
 
 endif
 
@@ -35,6 +44,7 @@ COMMON_OBJS = \
   $O/CrcReg.o \
   $O/DynLimBuf.o \
   $O/IntToString.o \
+  $O/LzFindPrepare.o \
   $O/MyMap.o \
   $O/MyString.o \
   $O/MyVector.o \
@@ -48,6 +58,7 @@ COMMON_OBJS = \
   $O/StringToInt.o \
   $O/UTFConvert.o \
   $O/Wildcard.o \
+  $O/Xxh64Reg.o \
   $O/XzCrc64Init.o \
   $O/XzCrc64Reg.o \
 
@@ -57,6 +68,7 @@ WIN_OBJS = \
   $O/FileIO.o \
   $O/FileName.o \
   $O/PropVariant.o \
+  $O/PropVariantConv.o \
   $O/PropVariantUtils.o \
   $O/System.o \
   $O/TimeUtils.o \
@@ -80,6 +92,7 @@ WIN_OBJS = \
   $O/UniqBlocks.o \
 
 AR_OBJS = \
+  $O/ApfsHandler.o \
   $O/ApmHandler.o \
   $O/ArHandler.o \
   $O/ArjHandler.o \
@@ -99,6 +112,7 @@ AR_OBJS = \
   $O/HandlerCont.o \
   $O/HfsHandler.o \
   $O/IhexHandler.o \
+  $O/LpHandler.o \
   $O/LzhHandler.o \
   $O/LzmaHandler.o \
   $O/MachoHandler.o \
@@ -110,16 +124,22 @@ AR_OBJS = \
   $O/PpmdHandler.o \
   $O/QcowHandler.o \
   $O/RpmHandler.o \
+  $O/SparseHandler.o \
   $O/SplitHandler.o \
   $O/SquashfsHandler.o \
   $O/SwfHandler.o \
   $O/UefiHandler.o \
   $O/VdiHandler.o \
   $O/VhdHandler.o \
+  $O/VhdxHandler.o \
   $O/VmdkHandler.o \
   $O/XarHandler.o \
   $O/XzHandler.o \
   $O/ZHandler.o \
+  $O/ZstdHandler.o \
+
+#  $O/AvbHandler.o
+#  $O/LvmHandler.o
 
 AR_COMMON_OBJS = \
   $O/CoderMixer2.o \
@@ -173,9 +193,13 @@ NSIS_OBJS = \
   $O/NsisIn.o \
   $O/NsisRegister.o \
 
+ifndef DISABLE_RAR
 RAR_OBJS = \
   $O/RarHandler.o \
   $O/Rar5Handler.o \
+
+endif
+
 
 TAR_OBJS = \
   $O/TarHandler.o \
@@ -243,12 +267,6 @@ COMPRESS_OBJS = \
   $O/PpmdRegister.o \
   $O/PpmdZip.o \
   $O/QuantumDecoder.o \
-  $O/Rar1Decoder.o \
-  $O/Rar2Decoder.o \
-  $O/Rar3Decoder.o \
-  $O/Rar3Vm.o \
-  $O/Rar5Decoder.o \
-  $O/RarCodecsRegister.o \
   $O/ShrinkDecoder.o \
   $O/XpressDecoder.o \
   $O/XzDecoder.o \
@@ -256,7 +274,22 @@ COMPRESS_OBJS = \
   $O/ZlibDecoder.o \
   $O/ZlibEncoder.o \
   $O/ZDecoder.o \
+  $O/ZstdDecoder.o \
 
+ifdef DISABLE_RAR
+DISABLE_RAR_COMPRESS=1
+endif
+
+ifndef DISABLE_RAR_COMPRESS
+COMPRESS_OBJS += \
+  $O/Rar1Decoder.o \
+  $O/Rar2Decoder.o \
+  $O/Rar3Decoder.o \
+  $O/Rar3Vm.o \
+  $O/Rar5Decoder.o \
+  $O/RarCodecsRegister.o \
+
+endif
 
 CRYPTO_OBJS = \
   $O/7zAes.o \
@@ -267,17 +300,26 @@ CRYPTO_OBJS = \
   $O/MyAesReg.o \
   $O/Pbkdf2HmacSha1.o \
   $O/RandGen.o \
-  $O/Rar20Crypto.o \
-  $O/Rar5Aes.o \
-  $O/RarAes.o \
   $O/WzAes.o \
   $O/ZipCrypto.o \
   $O/ZipStrong.o \
 
+ifndef DISABLE_RAR
+CRYPTO_OBJS += \
+  $O/Rar20Crypto.o \
+  $O/Rar5Aes.o \
+  $O/RarAes.o \
+
+endif
+
 
 C_OBJS = \
   $O/7zBuf2.o \
+  $O/7zCrc.o \
+  $O/7zCrcOpt.o \
   $O/7zStream.o \
+  $O/Aes.o \
+  $O/AesOpt.o \
   $O/Alloc.o \
   $O/Bcj2.o \
   $O/Bcj2Enc.o \
@@ -304,28 +346,28 @@ C_OBJS = \
   $O/Ppmd8.o \
   $O/Ppmd8Dec.o \
   $O/Ppmd8Enc.o \
+  $O/Sha1.o \
+  $O/Sha1Opt.o \
+  $O/Sha256.o \
+  $O/Sha256Opt.o \
   $O/Sort.o \
+  $O/SwapBytes.o \
+  $O/Xxh64.o \
   $O/Xz.o \
   $O/XzDec.o \
   $O/XzEnc.o \
   $O/XzIn.o \
   $O/XzCrc64.o \
   $O/XzCrc64Opt.o \
-  $O/7zCrc.o \
-  $O/7zCrcOpt.o \
-  $O/Aes.o \
-  $O/AesOpt.o \
-  $O/Sha256.o \
-  $O/Sha256Opt.o \
-  $O/Sha1.o \
-  $O/Sha1Opt.o \
+  $O/ZstdDec.o \
 
 ARC_OBJS = \
-	$(LZMA_DEC_OPT_OBJS) \
+  $(LZMA_DEC_OPT_OBJS) \
   $(C_OBJS) \
   $(MT_OBJS) \
   $(COMMON_OBJS) \
   $(WIN_OBJS) \
+  $(7ZIP_COMMON_OBJS) \
   $(AR_OBJS) \
   $(AR_COMMON_OBJS) \
   $(7Z_OBJS) \
@@ -341,5 +383,5 @@ ARC_OBJS = \
   $(ZIP_OBJS) \
   $(COMPRESS_OBJS) \
   $(CRYPTO_OBJS) \
-  $(7ZIP_COMMON_OBJS) \
 
+# we need empty line after last line above

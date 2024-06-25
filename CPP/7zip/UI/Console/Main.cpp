@@ -5,13 +5,39 @@
 #include "../../../Common/MyWindows.h"
 
 #ifdef _WIN32
-#include <Psapi.h>
+
+#ifndef Z7_OLD_WIN_SDK
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#include <psapi.h>
 #else
+#include <Psapi.h>
+#endif
+
+#else // Z7_OLD_WIN_SDK
+
+typedef struct {
+    DWORD cb;
+    DWORD PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+} PROCESS_MEMORY_COUNTERS;
+typedef PROCESS_MEMORY_COUNTERS *PPROCESS_MEMORY_COUNTERS;
+
+#endif // Z7_OLD_WIN_SDK
+
+#else // _WIN32
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/times.h>
-#endif
+#endif // _WIN32
 
 #include "../../../../C/CpuArch.h"
 
@@ -28,13 +54,14 @@
 
 #include "../../../Windows/ErrorMsg.h"
 #include "../../../Windows/TimeUtils.h"
+#include "../../../Windows/FileDir.h"
 
 #include "../Common/ArchiveCommandLine.h"
 #include "../Common/Bench.h"
 #include "../Common/ExitCode.h"
 #include "../Common/Extract.h"
 
-#ifdef EXTERNAL_CODECS
+#ifdef Z7_EXTERNAL_CODECS
 #include "../Common/LoadCodecs.h"
 #endif
 
@@ -48,7 +75,7 @@
 #include "OpenCallbackConsole.h"
 #include "UpdateCallbackConsole.h"
 
-#ifdef PROG_VARIANT_R
+#ifdef Z7_PROG_VARIANT_R
 #include "../../../../C/7zVersion.h"
 #else
 #include "../../MyVersion.h"
@@ -59,7 +86,9 @@ using namespace NFile;
 using namespace NCommandLineParser;
 
 #ifdef _WIN32
-HINSTANCE g_hInstance = 0;
+extern
+HINSTANCE g_hInstance;
+HINSTANCE g_hInstance = NULL;
 #endif
 
 extern CStdOutStream *g_StdStream;
@@ -71,14 +100,21 @@ extern const CCodecInfo *g_Codecs[];
 extern unsigned g_NumHashers;
 extern const CHasherInfo *g_Hashers[];
 
+#ifdef Z7_EXTERNAL_CODECS
+extern
+const CExternalCodecs *g_ExternalCodecs_Ptr;
+const CExternalCodecs *g_ExternalCodecs_Ptr;
+#endif
 
-#if defined(PROG_VARIANT_Z)
+DECLARE_AND_SET_CLIENT_VERSION_VAR
+
+#if defined(Z7_PROG_VARIANT_Z)
   #define PROG_POSTFIX      "z"
   #define PROG_POSTFIX_2  " (z)"
-#elif defined(PROG_VARIANT_R)
+#elif defined(Z7_PROG_VARIANT_R)
   #define PROG_POSTFIX      "r"
   #define PROG_POSTFIX_2  " (r)"
-#elif !defined(EXTERNAL_CODECS)
+#elif defined(Z7_PROG_VARIANT_A) || !defined(Z7_EXTERNAL_CODECS)
   #define PROG_POSTFIX      "a"
   #define PROG_POSTFIX_2  " (a)"
 #else
@@ -112,27 +148,34 @@ static const char * const kHelpString =
     "\n"
     "<Switches>\n"
     "  -- : Stop switches and @listfile parsing\n"
-    "  -ai[r[-|0]]{@listfile|!wildcard} : Include archives\n"
-    "  -ax[r[-|0]]{@listfile|!wildcard} : eXclude archives\n"
+    "  -ai[r[-|0]][m[-|2]][w[-]]{@listfile|!wildcard} : Include archives\n"
+    "  -ax[r[-|0]][m[-|2]][w[-]]{@listfile|!wildcard} : eXclude archives\n"
     "  -ao{a|s|t|u} : set Overwrite mode\n"
     "  -an : disable archive_name field\n"
     "  -bb[0-3] : set output log level\n"
     "  -bd : disable progress indicator\n"
     "  -bs{o|e|p}{0|1|2} : set output stream for output/error/progress line\n"
     "  -bt : show execution time statistics\n"
-    "  -i[r[-|0]]{@listfile|!wildcard} : Include filenames\n"
+    "  -i[r[-|0]][m[-|2]][w[-]]{@listfile|!wildcard} : Include filenames\n"
     "  -m{Parameters} : set compression Method\n"
     "    -mmt[N] : set number of CPU threads\n"
     "    -mx[N] : set compression level: -mx1 (fastest) ... -mx9 (ultra)\n"
     "  -o{Directory} : set Output directory\n"
-    #ifndef _NO_CRYPTO
+    #ifndef Z7_NO_CRYPTO
     "  -p{Password} : set Password\n"
     #endif
-    "  -r[-|0] : Recurse subdirectories\n"
+    "  -r[-|0] : Recurse subdirectories for name search\n"
     "  -sa{a|e|s} : set Archive name mode\n"
-    "  -scc{UTF-8|WIN|DOS} : set charset for for console input/output\n"
+    "  -scc{UTF-8|WIN|DOS} : set charset for console input/output\n"
     "  -scs{UTF-8|UTF-16LE|UTF-16BE|WIN|DOS|{id}} : set charset for list files\n"
-    "  -scrc[CRC32|CRC64|SHA1|SHA256|*] : set hash function for x, e, h commands\n"
+    "  -scrc[CRC32|CRC64|SHA256"
+#ifndef Z7_PROG_VARIANT_R
+    "|SHA1|XXH64"
+#ifdef Z7_PROG_VARIANT_Z
+    "|BLAKE2SP"
+#endif
+#endif
+    "|*] : set hash function for x, e, h commands\n"
     "  -sdel : delete files after compression\n"
     "  -seml[.] : send archive by email\n"
     "  -sfx[{name}] : Create SFX archive\n"
@@ -146,7 +189,7 @@ static const char * const kHelpString =
     "  -so : write data to stdout\n"
     "  -spd : disable wildcard matching for file names\n"
     "  -spe : eliminate duplication of root folder for extract command\n"
-    "  -spf : use fully qualified file paths\n"
+    "  -spf[2] : use fully qualified file paths\n"
     "  -ssc[-] : set sensitive case mode\n"
     "  -sse : stop archive creating, if it can't open some input file\n"
     "  -ssp : do not change Last Access Time of source files while archiving\n"
@@ -158,7 +201,7 @@ static const char * const kHelpString =
     "  -u[-][p#][q#][r#][x#][y#][z#][!newArchiveName] : Update options\n"
     "  -v{Size}[b|k|m|g] : Create volumes\n"
     "  -w[{path}] : assign Work directory. Empty path means a temporary directory\n"
-    "  -x[r[-|0]]{@listfile|!wildcard} : eXclude filenames\n"
+    "  -x[r[-|0]][m[-|2]][w[-]]{@listfile|!wildcard} : eXclude filenames\n"
     "  -y : assume Yes on all queries\n";
 
 // ---------------------------
@@ -170,9 +213,11 @@ static const char * const kNoFormats = "7-Zip cannot find the code that works wi
 static const char * const kUnsupportedArcTypeMessage = "Unsupported archive type";
 // static const char * const kUnsupportedUpdateArcType = "Can't create archive for that type";
 
+#ifndef Z7_EXTRACT_ONLY
 #define kDefaultSfxModule "7zCon.sfx"
+#endif
 
-MY_ATTR_NORETURN
+Z7_ATTR_NORETURN
 static void ShowMessageAndThrowException(LPCSTR message, NExitCode::EEnum code)
 {
   if (g_ErrStream)
@@ -200,63 +245,103 @@ static void ShowProgInfo(CStdOutStream *so)
   #endif
   */
 
-  #ifdef __VERSION__
-     << " compiler: " << __VERSION__
-  #endif
-
-  #ifdef __GNUC__
-     << " GCC " << __GNUC__ << "." << __GNUC_MINOR__ << "." << __GNUC_PATCHLEVEL__
-  #endif
-
-  #ifdef __clang__
-     << " CLANG " << __clang_major__ << "." << __clang_minor__
-  #endif
-
-  #ifdef __xlC__
-      << " XLC " << (__xlC__ >> 8) << "." << (__xlC__ & 0xFF)
-    #ifdef __xlC_ver__
-      << "." << (__xlC_ver__ >> 8) << "." << (__xlC_ver__ & 0xFF)
-    #endif
-  #endif
-
-  #ifdef _MSC_VER
-     << " MSC " << _MSC_VER
-  #endif
-  
-  #ifdef __ARM_FEATURE_CRC32
-     << " CRC32"
-  #endif
-
   << " " << (unsigned)(sizeof(void *)) * 8 << "-bit"
 
   #ifdef __ILP32__
     << " ILP32"
   #endif
-  
+
   #ifdef __ARM_ARCH
   << " arm_v:" << __ARM_ARCH
+  #if (__ARM_ARCH == 8)
+    // for macos:
+    #if   defined(__ARM_ARCH_8_9__)
+      << ".9"
+    #elif defined(__ARM_ARCH_8_8__)
+      << ".8"
+    #elif defined(__ARM_ARCH_8_7__)
+      << ".7"
+    #elif defined(__ARM_ARCH_8_6__)
+      << ".6"
+    #elif defined(__ARM_ARCH_8_5__)
+      << ".5"
+    #elif defined(__ARM_ARCH_8_4__)
+      << ".4"
+    #elif defined(__ARM_ARCH_8_3__)
+      << ".3"
+    #elif defined(__ARM_ARCH_8_2__)
+      << ".2"
+    #elif defined(__ARM_ARCH_8_1__)
+      << ".1"
+    #endif
+  #endif
+    
+    #if defined(__ARM_ARCH_PROFILE) && \
+        (   __ARM_ARCH_PROFILE >= 'A' && __ARM_ARCH_PROFILE <= 'Z' \
+         || __ARM_ARCH_PROFILE >= 65  && __ARM_ARCH_PROFILE <= 65 + 25)
+      << "-" << (char)__ARM_ARCH_PROFILE
+    #endif
+
   #ifdef __ARM_ARCH_ISA_THUMB
   << " thumb:" << __ARM_ARCH_ISA_THUMB
   #endif
   #endif
 
-
-  #ifdef ENV_HAVE_LOCALE
-  << " locale=" << GetLocale()
+  #ifdef _MIPS_ARCH
+  << " mips_arch:" << _MIPS_ARCH
   #endif
-  #ifndef _WIN32
-  << " UTF8=" << (IsNativeUTF8() ? "+" : "-")
-  << " use-UTF8=" << (g_ForceToUTF8 ? "+" : "-")
-  << " wchar_t=" << (unsigned)(sizeof(wchar_t)) * 8 << "-bit"
-  << " Files=" << (unsigned)(sizeof(off_t)) * 8 << "-bit"
+  #ifdef __mips_isa_rev
+  << " mips_isa_rev:" << __mips_isa_rev
+  #endif
+
+  #ifdef __iset__
+  << " e2k_v:" << __iset__
   #endif
   ;
+
+
+
+  #ifdef ENV_HAVE_LOCALE
+    *so << " locale=" << GetLocale();
+  #endif
+  #ifndef _WIN32
+  {
+    const bool is_IsNativeUTF8 = IsNativeUTF8();
+    if (!is_IsNativeUTF8)
+      *so << " UTF8=" << (is_IsNativeUTF8 ? "+" : "-");
+  }
+  if (!g_ForceToUTF8)
+    *so << " use-UTF8=" << (g_ForceToUTF8 ? "+" : "-");
+  {
+    const unsigned wchar_t_size = (unsigned)sizeof(wchar_t);
+    if (wchar_t_size != 4)
+      *so << " wchar_t=" << wchar_t_size * 8 << "-bit";
+  }
+  {
+    const unsigned off_t_size = (unsigned)sizeof(off_t);
+    if (off_t_size != 8)
+      *so << " Files=" << off_t_size * 8 << "-bit";
+  }
+  #endif
   
   {
     const UInt32 numCpus = NWindows::NSystem::GetNumberOfProcessors();
     *so << " Threads:" << numCpus;
+    const UInt64 openMAX= NWindows::NSystem::Get_File_OPEN_MAX();
+    *so << " OPEN_MAX:" << openMAX;
+    {
+      FString temp;
+      NDir::MyGetTempPath(temp);
+      if (!temp.IsEqualTo(STRING_PATH_SEPARATOR "tmp" STRING_PATH_SEPARATOR))
+        *so << " temp_path:" << temp;
+    }
   }
 
+  #ifdef Z7_7ZIP_ASM
+  *so << ", ASM";
+  #endif
+
+  /*
   {
     AString s;
     GetCpuName(s);
@@ -264,9 +349,10 @@ static void ShowProgInfo(CStdOutStream *so)
     *so << ", " << s;
   }
 
-  #ifdef _7ZIP_ASM
-  *so << ",ASM";
+  #ifdef __ARM_FEATURE_CRC32
+     << " CRC32"
   #endif
+
   
   #if (defined MY_CPU_X86_OR_AMD64 || defined(MY_CPU_ARM_OR_ARM64))
   if (CPU_IsSupported_AES()) *so << ",AES";
@@ -281,6 +367,7 @@ static void ShowProgInfo(CStdOutStream *so)
   if (CPU_IsSupported_SHA2()) *so << ",SHA2";
   #endif
   #endif
+  */
 
   *so << endl;
 }
@@ -314,6 +401,17 @@ static void PrintUInt32(CStdOutStream &so, UInt32 val, unsigned size)
   PrintStringRight(so, s, size);
 }
 
+#ifdef Z7_EXTERNAL_CODECS
+static void PrintNumber(CStdOutStream &so, UInt32 val, unsigned numDigits)
+{
+  AString s;
+  s.Add_UInt32(val);
+  while (s.Len() < numDigits)
+    s.InsertAtFront('0');
+  so << s;
+}
+#endif
+
 static void PrintLibIndex(CStdOutStream &so, int libIndex)
 {
   if (libIndex >= 0)
@@ -331,16 +429,11 @@ static void PrintString(CStdOutStream &so, const UString &s, unsigned size)
     so << ' ';
 }
 
-static inline char GetHex(unsigned val)
-{
-  return (char)((val < 10) ? ('0' + val) : ('A' + (val - 10)));
-}
-
 static void PrintWarningsPaths(const CErrorPathCodes &pc, CStdOutStream &so)
 {
   FOR_VECTOR(i, pc.Paths)
   {
-    so.NormalizePrint_UString(fs2us(pc.Paths[i]));
+    so.NormalizePrint_UString_Path(fs2us(pc.Paths[i]));
     so << " : ";
     so << NError::MyFormatMessage(pc.Codes[i]) << endl;
   }
@@ -481,8 +574,12 @@ static void PrintMemUsage(const char *s, UInt64 val)
   *g_StdStream << "    " << s << " Memory =";
   PrintNum(SHIFT_SIZE_VALUE(val, 20), 7);
   *g_StdStream << " MB";
-
-  #ifdef _7ZIP_LARGE_PAGES
+  /*
+  *g_StdStream << " =";
+  PrintNum(SHIFT_SIZE_VALUE(val, 10), 9);
+  *g_StdStream << " KB";
+  */
+  #ifdef Z7_LARGE_PAGES
   AString lp;
   Add_LargePages_String(lp);
   if (!lp.IsEmpty())
@@ -513,10 +610,12 @@ static void PrintStat()
       , &creationTimeFT, &exitTimeFT, &kernelTimeFT, &userTimeFT))
     return;
   FILETIME curTimeFT;
-  NTime::GetCurUtcFileTime(curTimeFT);
+  NTime::GetCurUtc_FiTime(curTimeFT);
 
   #ifndef UNDER_CE
   
+Z7_DIAGNOSTIC_IGNORE_CAST_FUNCTION
+
   PROCESS_MEMORY_COUNTERS m;
   memset(&m, 0, sizeof(m));
   BOOL memDefined = FALSE;
@@ -531,22 +630,27 @@ static void PrintStat()
        The program with K32GetProcessMemoryInfo will not work on systems before Win7
        // memDefined = GetProcessMemoryInfo(GetCurrentProcess(), &m, sizeof(m));
     */
-
-    HMODULE kern = ::GetModuleHandleW(L"kernel32.dll");
-    Func_GetProcessMemoryInfo my_GetProcessMemoryInfo = (Func_GetProcessMemoryInfo)
-        (void *)::GetProcAddress(kern, "K32GetProcessMemoryInfo");
+    const HMODULE kern = ::GetModuleHandleW(L"kernel32.dll");
+    Func_GetProcessMemoryInfo
+      my_GetProcessMemoryInfo = Z7_GET_PROC_ADDRESS(
+    Func_GetProcessMemoryInfo, kern,
+     "K32GetProcessMemoryInfo");
     if (!my_GetProcessMemoryInfo)
     {
-      HMODULE lib = LoadLibraryW(L"Psapi.dll");
+      const HMODULE lib = LoadLibraryW(L"Psapi.dll");
       if (lib)
-        my_GetProcessMemoryInfo = (Func_GetProcessMemoryInfo)(void *)::GetProcAddress(lib, "GetProcessMemoryInfo");
+          my_GetProcessMemoryInfo = Z7_GET_PROC_ADDRESS(
+        Func_GetProcessMemoryInfo, lib,
+            "GetProcessMemoryInfo");
     }
     if (my_GetProcessMemoryInfo)
       memDefined = my_GetProcessMemoryInfo(GetCurrentProcess(), &m, sizeof(m));
     // FreeLibrary(lib);
-
-    Func_QueryProcessCycleTime my_QueryProcessCycleTime = (Func_QueryProcessCycleTime)
-        (void *)::GetProcAddress(kern, "QueryProcessCycleTime");
+    const
+    Func_QueryProcessCycleTime
+      my_QueryProcessCycleTime = Z7_GET_PROC_ADDRESS(
+    Func_QueryProcessCycleTime, kern,
+        "QueryProcessCycleTime");
     if (my_QueryProcessCycleTime)
       cycleDefined = my_QueryProcessCycleTime(GetCurrentProcess(), &cycleTime);
   }
@@ -596,6 +700,7 @@ static void PrintStat()
   #ifndef UNDER_CE
   if (memDefined) PrintMemUsage("Physical", m.PeakWorkingSetSize);
   #endif
+  *g_StdStream << endl;
 }
 
 
@@ -604,7 +709,7 @@ static void PrintStat()
 static UInt64 Get_timeofday_us()
 {
   struct timeval now;
-  if (gettimeofday(&now, 0 ) == 0)
+  if (gettimeofday(&now, NULL) == 0)
     return (UInt64)now.tv_sec * 1000000 + (UInt64)now.tv_usec;
   return 0;
 }
@@ -667,7 +772,7 @@ static void PrintTime(const char *s, UInt64 val, UInt64 total_us, UInt64 kFreq)
   *g_StdStream << '%';
 }
 
-static void PrintStat(UInt64 startTime)
+static void PrintStat(const UInt64 startTime)
 {
   tms t;
   /* clock_t res = */ times(&t);
@@ -723,8 +828,22 @@ int Main2(
   #endif
 
   #ifndef _WIN32
-  UInt64 startTime = Get_timeofday_us();
+  const UInt64 startTime = Get_timeofday_us();
   #endif
+
+  /*
+  {
+    g_StdOut << "DWORD:" << (unsigned)sizeof(DWORD);
+    g_StdOut << " LONG:" << (unsigned)sizeof(LONG);
+    g_StdOut << " long:" << (unsigned)sizeof(long);
+    #ifdef _WIN64
+    // g_StdOut << " long long:" << (unsigned)sizeof(long long);
+    #endif
+    g_StdOut << " int:" << (unsigned)sizeof(int);
+    g_StdOut << " void*:"  << (unsigned)sizeof(void *);
+    g_StdOut << endl;
+  }
+  */
 
   UStringVector commandStrings;
   
@@ -738,11 +857,11 @@ int Main2(
     for (int i = 0; i < numArgs; i++)
     {
       AString a (args[i]);
-      /*
+#if 0
       printf("\n%d %s :", i, a.Ptr());
       for (unsigned k = 0; k < a.Len(); k++)
         printf(" %2x", (unsigned)(Byte)a[k]);
-      */
+#endif
       const UString s = MultiByteToUnicodeString(a);
       commandStrings.Add(s);
     }
@@ -779,7 +898,7 @@ int Main2(
 
   CStdOutStream *percentsStream = NULL;
   if (options.Number_for_Percents != k_OutStream_disabled)
-    percentsStream = (options.Number_for_Percents == k_OutStream_stderr) ? &g_StdErr : &g_StdOut;;
+    percentsStream = (options.Number_for_Percents == k_OutStream_stderr) ? &g_StdErr : &g_StdOut;
   
   if (options.HelpMode)
   {
@@ -834,6 +953,8 @@ int Main2(
     if (stderr_cp != -1) g_StdErr.CodePage = stderr_cp;
     if (stdin_cp != -1) g_StdIn.CodePage = stdin_cp;
   }
+  g_StdOut.ListPathSeparatorSlash = options.ListPathSeparatorSlash;
+  g_StdErr.ListPathSeparatorSlash = options.ListPathSeparatorSlash;
 
   unsigned percentsNameLevel = 1;
   if (options.LogLevel == 0 || options.Number_for_Percents != options.Number_for_Out)
@@ -848,26 +969,29 @@ int Main2(
     #if !defined(UNDER_CE)
     CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
     if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &consoleInfo))
-      consoleWidth = (unsigned)consoleInfo.dwSize.X;
+      consoleWidth = (USHORT)consoleInfo.dwSize.X;
     #endif
     
     #else
     
+#if !defined(__sun)
     struct winsize w;
     if (ioctl(0, TIOCGWINSZ, &w) == 0)
       consoleWidth = w.ws_col;
-    
+#endif
     #endif
   }
 
   CREATE_CODECS_OBJECT
 
-  codecs->CaseSensitiveChange = options.CaseSensitiveChange;
+  codecs->CaseSensitive_Change = options.CaseSensitive_Change;
   codecs->CaseSensitive = options.CaseSensitive;
   ThrowException_if_Error(codecs->Load());
+  Codecs_AddHashArcHandler(codecs);
 
-  #ifdef EXTERNAL_CODECS
+  #ifdef Z7_EXTERNAL_CODECS
   {
+    g_ExternalCodecs_Ptr = &_externalCodecs;
     UString s;
     codecs->GetCodecsErrorMessage(s);
     if (!s.IsEmpty())
@@ -878,15 +1002,14 @@ int Main2(
   }
   #endif
 
-
-  bool isExtractGroupCommand = options.Command.IsFromExtractGroup();
+  const bool isExtractGroupCommand = options.Command.IsFromExtractGroup();
 
   if (codecs->Formats.Size() == 0 &&
         (isExtractGroupCommand
         || options.Command.CommandType == NCommandType::kList
         || options.Command.IsFromUpdateGroup()))
   {
-    #ifdef EXTERNAL_CODECS
+    #ifdef Z7_EXTERNAL_CODECS
     if (!codecs->MainDll_ErrorPath.IsEmpty())
     {
       UString s ("Can't load module: ");
@@ -894,13 +1017,15 @@ int Main2(
       throw s;
     }
     #endif
-    
     throw kNoFormats;
   }
 
   CObjectVector<COpenType> types;
   if (!ParseOpenTypes(*codecs, options.ArcType, types))
+  {
     throw kUnsupportedArcTypeMessage;
+  }
+
 
   CIntVector excludedFormats;
   FOR_VECTOR (k, options.ExcludedArcTypes)
@@ -909,16 +1034,19 @@ int Main2(
     if (!codecs->FindFormatForArchiveType(options.ExcludedArcTypes[k], tempIndices)
         || tempIndices.Size() != 1)
       throw kUnsupportedArcTypeMessage;
+    
+    
+    
     excludedFormats.AddToUniqueSorted(tempIndices[0]);
     // excludedFormats.Sort();
   }
-
   
-  #ifdef EXTERNAL_CODECS
+  #ifdef Z7_EXTERNAL_CODECS
   if (isExtractGroupCommand
+      || options.Command.IsFromUpdateGroup()
       || options.Command.CommandType == NCommandType::kHash
       || options.Command.CommandType == NCommandType::kBenchmark)
-    ThrowException_if_Error(__externalCodecs.Load());
+    ThrowException_if_Error(_externalCodecs.Load());
   #endif
 
   int retCode = NExitCode::kSuccess;
@@ -938,38 +1066,54 @@ int Main2(
     CStdOutStream &so = (g_StdStream ? *g_StdStream : g_StdOut);
     unsigned i;
 
-    #ifdef EXTERNAL_CODECS
+    #ifdef Z7_EXTERNAL_CODECS
     so << endl << "Libs:" << endl;
     for (i = 0; i < codecs->Libs.Size(); i++)
     {
       PrintLibIndex(so, (int)i);
-      so << ' ' << codecs->Libs[i].Path << endl;
+      const CCodecLib &lib = codecs->Libs[i];
+      // if (lib.Version != 0)
+      so << ": " << (lib.Version >> 16) << ".";
+      PrintNumber(so, lib.Version & 0xffff, 2);
+      so << " : " << lib.Path << endl;
     }
     #endif
 
     so << endl << "Formats:" << endl;
     
-    const char * const kArcFlags = "KSNFMGOPBELHX";
+    const char * const kArcFlags = "KSNFMGOPBELHXCc+a+m+r+";
+    const char * const kArcTimeFlags = "wudn";
     const unsigned kNumArcFlags = (unsigned)strlen(kArcFlags);
-    
+    const unsigned kNumArcTimeFlags = (unsigned)strlen(kArcTimeFlags);
+
     for (i = 0; i < codecs->Formats.Size(); i++)
     {
       const CArcInfoEx &arc = codecs->Formats[i];
 
-      #ifdef EXTERNAL_CODECS
+      #ifdef Z7_EXTERNAL_CODECS
       PrintLibIndex(so, arc.LibIndex);
       #else
-      so << "  ";
+      so << "   ";
       #endif
 
       so << (char)(arc.UpdateEnabled ? 'C' : ' ');
       
-      for (unsigned b = 0; b < kNumArcFlags; b++)
       {
-        so << (char)
-          ((arc.Flags & ((UInt32)1 << b)) != 0 ? kArcFlags[b] : ' ');
+        unsigned b;
+        for (b = 0; b < kNumArcFlags; b++)
+          so << (char)((arc.Flags & ((UInt32)1 << b)) != 0 ? kArcFlags[b] : '.');
+        so << ' ';
       }
-        
+
+      if (arc.TimeFlags != 0)
+      {
+        unsigned b;
+        for (b = 0; b < kNumArcTimeFlags; b++)
+          so << (char)((arc.TimeFlags & ((UInt32)1 << b)) != 0 ? kArcTimeFlags[b] : '.');
+        so << arc.Get_DefaultTimePrec();
+        so << ' ';
+      }
+      
       so << ' ';
       PrintString(so, arc.Name, 8);
       so << ' ';
@@ -985,7 +1129,7 @@ int Main2(
         {
           s += " (";
           s += ext.AddExt;
-          s += ')';
+          s.Add_Char(')');
         }
       }
       
@@ -994,6 +1138,8 @@ int Main2(
       
       if (arc.SignatureOffset != 0)
         so << "offset=" << arc.SignatureOffset << ' ';
+
+      // so << "numSignatures = " << arc.Signatures.Size() << " ";
 
       FOR_VECTOR(si, arc.Signatures)
       {
@@ -1006,15 +1152,15 @@ int Main2(
         {
           if (j != 0)
             so << ' ';
-          Byte b = sig[j];
+          const unsigned b = sig.ConstData()[j];
           if (b > 0x20 && b < 0x80)
           {
             so << (char)b;
           }
           else
           {
-            so << GetHex((b >> 4) & 0xF);
-            so << GetHex(b & 0xF);
+            so << GET_HEX_CHAR_UPPER(b >> 4);
+            so << GET_HEX_CHAR_UPPER(b & 15);
           }
         }
       }
@@ -1036,6 +1182,7 @@ int Main2(
       
       so << (char)(cod.CreateEncoder ? 'E' : ' ');
       so << (char)(cod.CreateDecoder ? 'D' : ' ');
+      so << (char)(cod.IsFilter      ? 'F' : ' ');
 
       so << ' ';
       PrintHexId(so, cod.Id);
@@ -1043,10 +1190,10 @@ int Main2(
     }
 
 
-    #ifdef EXTERNAL_CODECS
+    #ifdef Z7_EXTERNAL_CODECS
 
     UInt32 numMethods;
-    if (codecs->GetNumMethods(&numMethods) == S_OK)
+    if (_externalCodecs.GetCodecs->GetNumMethods(&numMethods) == S_OK)
     for (UInt32 j = 0; j < numMethods; j++)
     {
       PrintLibIndex(so, codecs->GetCodec_LibIndex(j));
@@ -1059,6 +1206,12 @@ int Main2(
       
       so << (char)(codecs->GetCodec_EncoderIsAssigned(j) ? 'E' : ' ');
       so << (char)(codecs->GetCodec_DecoderIsAssigned(j) ? 'D' : ' ');
+      {
+        bool isFilter_Assigned;
+        const bool isFilter = codecs->GetCodec_IsFilter(j, isFilter_Assigned);
+        so << (char)(isFilter ? 'F' : isFilter_Assigned ? ' ' : '*');
+      }
+
 
       so << ' ';
       UInt64 id;
@@ -1084,9 +1237,9 @@ int Main2(
       so << ' ' << codec.Name << endl;
     }
 
-    #ifdef EXTERNAL_CODECS
+    #ifdef Z7_EXTERNAL_CODECS
     
-    numMethods = codecs->GetNumHashers();
+    numMethods = _externalCodecs.GetHashers->GetNumHashers();
     for (UInt32 j = 0; j < numMethods; j++)
     {
       PrintLibIndex(so, codecs->GetHasherLibIndex(j));
@@ -1127,7 +1280,9 @@ int Main2(
     {
       CExtractScanConsole scan;
       
-      scan.Init(options.EnableHeaders ? g_StdStream : NULL, g_ErrStream, percentsStream);
+      scan.Init(options.EnableHeaders ? g_StdStream : NULL,
+          g_ErrStream, percentsStream,
+          options.DisablePercents);
       scan.SetWindowWidth(consoleWidth);
 
       if (g_StdStream && options.EnableHeaders)
@@ -1172,12 +1327,12 @@ int Main2(
       CExtractCallbackConsole *ecs = new CExtractCallbackConsole;
       CMyComPtr<IFolderArchiveExtractCallback> extractCallback = ecs;
 
-      #ifndef _NO_CRYPTO
+      #ifndef Z7_NO_CRYPTO
       ecs->PasswordIsDefined = options.PasswordEnabled;
       ecs->Password = options.Password;
       #endif
 
-      ecs->Init(g_StdStream, g_ErrStream, percentsStream);
+      ecs->Init(g_StdStream, g_ErrStream, percentsStream, options.DisablePercents);
       ecs->MultiArcMode = (ArchivePathsSorted.Size() > 1);
 
       ecs->LogLevel = options.LogLevel;
@@ -1190,7 +1345,7 @@ int Main2(
       COpenCallbackConsole openCallback;
       openCallback.Init(g_StdStream, g_ErrStream);
 
-      #ifndef _NO_CRYPTO
+      #ifndef Z7_NO_CRYPTO
       openCallback.PasswordIsDefined = options.PasswordEnabled;
       openCallback.Password = options.Password;
       #endif
@@ -1204,7 +1359,7 @@ int Main2(
       eo.YesToAll = options.YesToAll;
       eo.TestMode = options.Command.IsTestCommand();
       
-      #ifndef _SFX
+      #ifndef Z7_SFX
       eo.Properties = options.Properties;
       #endif
 
@@ -1221,13 +1376,16 @@ int Main2(
       }
       
       hresultMain = Extract(
+          // EXTERNAL_CODECS_VARS_L
           codecs,
           types,
           excludedFormats,
           ArchivePathsSorted,
           ArchivePathsFullSorted,
           options.Censor.Pairs.Front().Head,
-          eo, ecs, ecs, hashCalc, errorMessage, stat);
+          eo,
+          ecs, ecs, ecs,
+          hashCalc, errorMessage, stat);
       
       ecs->ClosePercents();
 
@@ -1335,7 +1493,13 @@ int Main2(
       
       // options.ExtractNtOptions.StoreAltStreams = true, if -sns[-] is not definmed
 
+      CListOptions lo;
+      lo.ExcludeDirItems = options.Censor.ExcludeDirItems;
+      lo.ExcludeFileItems = options.Censor.ExcludeFileItems;
+      lo.DisablePercents = options.DisablePercents;
+
       hresultMain = ListArchives(
+          lo,
           codecs,
           types,
           excludedFormats,
@@ -1347,7 +1511,7 @@ int Main2(
           options.Censor.Pairs.Front().Head,
           options.EnableHeaders,
           options.TechMode,
-          #ifndef _NO_CRYPTO
+          #ifndef Z7_NO_CRYPTO
           options.PasswordEnabled,
           options.Password,
           #endif
@@ -1369,14 +1533,17 @@ int Main2(
   }
   else if (options.Command.IsFromUpdateGroup())
   {
+   #ifdef Z7_EXTRACT_ONLY
+    throw "update commands are not implemented";
+   #else
     CUpdateOptions &uo = options.UpdateOptions;
     if (uo.SfxMode && uo.SfxModule.IsEmpty())
       uo.SfxModule = kDefaultSfxModule;
 
     COpenCallbackConsole openCallback;
-    openCallback.Init(g_StdStream, g_ErrStream, percentsStream);
+    openCallback.Init(g_StdStream, g_ErrStream, percentsStream, options.DisablePercents);
 
-    #ifndef _NO_CRYPTO
+    #ifndef Z7_NO_CRYPTO
     bool passwordIsDefined =
         (options.PasswordEnabled && !options.Password.IsEmpty());
     openCallback.PasswordIsDefined = passwordIsDefined;
@@ -1390,7 +1557,7 @@ int Main2(
     if (percentsStream)
       callback.SetWindowWidth(consoleWidth);
 
-    #ifndef _NO_CRYPTO
+    #ifndef Z7_NO_CRYPTO
     callback.PasswordIsDefined = passwordIsDefined;
     callback.AskPassword = (options.PasswordEnabled && options.Password.IsEmpty());
     callback.Password = options.Password;
@@ -1399,7 +1566,7 @@ int Main2(
     callback.StdOutMode = uo.StdOutMode;
     callback.Init(
       // NULL,
-      g_StdStream, g_ErrStream, percentsStream);
+      g_StdStream, g_ErrStream, percentsStream, options.DisablePercents);
 
     CUpdateErrorInfo errorInfo;
 
@@ -1424,6 +1591,7 @@ int Main2(
         g_StdStream, se,
         true // options.EnableHeaders
         );
+   #endif
   }
   else if (options.Command.CommandType == NCommandType::kHash)
   {
@@ -1433,8 +1601,9 @@ int Main2(
     if (percentsStream)
       callback.SetWindowWidth(consoleWidth);
   
-    callback.Init(g_StdStream, g_ErrStream, percentsStream);
+    callback.Init(g_StdStream, g_ErrStream, percentsStream, options.DisablePercents);
     callback.PrintHeaders = options.EnableHeaders;
+    callback.PrintFields = options.ListFields;
 
     AString errorInfoString;
     hresultMain = HashCalc(EXTERNAL_CODECS_VARS_L

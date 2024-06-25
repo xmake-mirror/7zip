@@ -4,7 +4,17 @@ PROG = lzma
 # USE_ASM = 1
 # ST_MODE = 1
 
+ifdef SystemDrive
+IS_MINGW = 1
+else
+ifdef SYSTEMDRIVE
+# ifdef OS
+IS_MINGW = 1
+endif
+endif
+
 include ../../LzmaDec_gcc.mak
+
 
 LOCAL_FLAGS_ST =
 MT_OBJS =
@@ -12,14 +22,15 @@ MT_OBJS =
 
 ifdef ST_MODE
 
-LOCAL_FLAGS_ST = -D_7ZIP_ST
+LOCAL_FLAGS_ST = -DZ7_ST
 
 else
 
 MT_OBJS = \
   $O/LzFindMt.o \
-  $O/Synchronization.o \
+  $O/LzFindOpt.o \
   $O/Threads.o \
+  $O/Synchronization.o \
 
 
 
@@ -29,11 +40,14 @@ endif
 
 LOCAL_FLAGS_SYS =
 
-ifdef SystemDrive
+ifdef IS_MINGW
 
 SYS_OBJS = \
   $O/Registry.o \
   $O/resource.o \
+
+LOCAL_FLAGS_SYS = \
+  -DZ7_NO_LONG_PATH \
 
 else
 
@@ -48,6 +62,7 @@ endif
 
 LOCAL_FLAGS = \
   $(LOCAL_FLAGS_ST) \
+  $(LOCAL_FLAGS_SYS) \
 
 
 COMMON_OBJS = \
@@ -55,12 +70,14 @@ COMMON_OBJS = \
   $O/CRC.o \
   $O/CrcReg.o \
   $O/IntToString.o \
+  $O/LzFindPrepare.o \
   $O/MyString.o \
   $O/MyVector.o \
   $O/NewHandler.o \
   $O/StringConvert.o \
   $O/StringToInt.o \
   $O/UTFConvert.o \
+  $O/Wildcard.o \
 
 WIN_OBJS = \
   $O/FileIO.o \
@@ -83,6 +100,7 @@ CONSOLE_OBJS = \
   $O/FileStreams.o \
   $O/FilterCoder.o \
   $O/MethodProps.o \
+  $O/StreamObjects.o \
   $O/StreamUtils.o \
 
 C_OBJS = \
@@ -98,7 +116,7 @@ C_OBJS = \
   $O/Lzma86Enc.o \
 
 OBJS = \
-	$(LZMA_DEC_OPT_OBJS) \
+  $(LZMA_DEC_OPT_OBJS) \
   $(C_OBJS) \
   $(MT_OBJS) \
   $(SYS_OBJS) \

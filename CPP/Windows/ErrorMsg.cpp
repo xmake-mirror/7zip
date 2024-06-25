@@ -19,6 +19,14 @@ namespace NError {
 
 static bool MyFormatMessage(DWORD errorCode, UString &message)
 {
+  #ifndef Z7_SFX
+  if ((HRESULT)errorCode == MY_HRES_ERROR_INTERNAL_ERROR)
+  {
+    message = "Internal Error: The failure in hardware (RAM or CPU), OS or program";
+    return true;
+  }
+  #endif
+
   #ifdef _WIN32
   
   LPVOID msgBuf;
@@ -64,16 +72,16 @@ static bool MyFormatMessage(DWORD errorCode, UString &message)
     case E_OUTOFMEMORY         : s = "E_OUTOFMEMORY : Can't allocate required memory"; break;
     case E_INVALIDARG          : s = "E_INVALIDARG : One or more arguments are invalid"; break;
     
-    // case MY__E_ERROR_NEGATIVE_SEEK : s = "MY__E_ERROR_NEGATIVE_SEEK"; break;
+    // case MY_E_ERROR_NEGATIVE_SEEK : s = "MY_E_ERROR_NEGATIVE_SEEK"; break;
     default:
       break;
   }
 
-  /* strerror() for unknow errors still shows message "Unknown error -12345678")
-     So we must trasfer error codes before strerror() */
+  /* strerror() for unknown errors still shows message "Unknown error -12345678")
+     So we must transfer error codes before strerror() */
   if (!s)
   {
-    if ((errorCode & 0xFFFF0000) == (UInt32)((MY__FACILITY__WRes << 16) | 0x80000000))
+    if ((errorCode & 0xFFFF0000) == (UInt32)((MY_FACILITY_WRes << 16) | 0x80000000))
       errorCode &= 0xFFFF;
     else if ((errorCode & ((UInt32)1 << 31)))
       return false; // we will show hex error later for that case

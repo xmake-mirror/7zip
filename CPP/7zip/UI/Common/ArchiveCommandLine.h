@@ -1,7 +1,7 @@
 // ArchiveCommandLine.h
 
-#ifndef __ARCHIVE_COMMAND_LINE_H
-#define __ARCHIVE_COMMAND_LINE_H
+#ifndef ZIP7_INC_ARCHIVE_COMMAND_LINE_H
+#define ZIP7_INC_ARCHIVE_COMMAND_LINE_H
 
 #include "../../../Common/CommandLineParser.h"
 #include "../../../Common/Wildcard.h"
@@ -51,7 +51,7 @@ struct CArcCmdLineOptions
   bool HelpMode;
 
   // bool LargePages;
-  bool CaseSensitiveChange;
+  bool CaseSensitive_Change;
   bool CaseSensitive;
 
   bool IsInTerminal;
@@ -60,11 +60,24 @@ struct CArcCmdLineOptions
   bool StdInMode;
   bool StdOutMode;
   bool EnableHeaders;
+  bool DisablePercents;
+
 
   bool YesToAll;
   bool ShowDialog;
   bool TechMode;
   bool ShowTime;
+  CBoolPair ListPathSeparatorSlash;
+
+  CBoolPair NtSecurity;
+  CBoolPair AltStreams;
+  CBoolPair HardLinks;
+  CBoolPair SymLinks;
+  
+  CBoolPair StoreOwnerId;
+  CBoolPair StoreOwnerName;
+
+  AString ListFields;
 
   int ConsoleCodePage;
 
@@ -73,14 +86,15 @@ struct CArcCmdLineOptions
   CArcCommand Command;
   UString ArchiveName;
 
-  #ifndef _NO_CRYPTO
+  #ifndef Z7_NO_CRYPTO
   bool PasswordEnabled;
   UString Password;
   #endif
 
   UStringVector HashMethods;
+  // UString HashFilePath;
 
-  bool AppendName;
+  // bool AppendName;
   // UStringVector ArchivePathsSorted;
   // UStringVector ArchivePathsFullSorted;
   NWildcard::CCensor arcCensor;
@@ -89,11 +103,6 @@ struct CArcCmdLineOptions
   CObjectVector<CProperty> Properties;
 
   CExtractOptionsBase ExtractOptions;
-
-  CBoolPair NtSecurity;
-  CBoolPair AltStreams;
-  CBoolPair HardLinks;
-  CBoolPair SymLinks;
 
   CUpdateOptions UpdateOptions;
   CHashOptions HashOptions;
@@ -109,11 +118,12 @@ struct CArcCmdLineOptions
 
   // Benchmark
   UInt32 NumIterations;
+  bool NumIterations_Defined;
 
   CArcCmdLineOptions():
       HelpMode(false),
       // LargePages(false),
-      CaseSensitiveChange(false),
+      CaseSensitive_Change(false),
       CaseSensitive(false),
 
       IsInTerminal(false),
@@ -124,6 +134,7 @@ struct CArcCmdLineOptions
       StdOutMode(false),
 
       EnableHeaders(false),
+      DisablePercents(false),
       
       YesToAll(false),
       ShowDialog(false),
@@ -138,7 +149,13 @@ struct CArcCmdLineOptions
 
       LogLevel(0)
   {
-  };
+    ListPathSeparatorSlash.Val =
+#ifdef _WIN32
+        false;
+#else
+        true;
+#endif
+  }
 };
 
 class CArcCmdLineParser
